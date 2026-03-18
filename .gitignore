@@ -1,0 +1,14 @@
+*__pycache__/
+ 
+ckpts*/
+wandb/
+ 
+results/
+test-inputs/
+samples/
+outputs*/
+ 
+data/*.txt
+universr.egg-info/
+
+
