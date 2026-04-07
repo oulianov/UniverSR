@@ -263,6 +263,10 @@ We've released our code under the [MIT License](LICENSE). If you find UniverSR u
 
 ```
 
+## 📝 Changelog
+### v0.1.1
+- Fixed short audio crash: added minimum length guard in `enhance()`
+
 ## 🙏 Acknowledgments
 
 This project was developed at [DSPAI Lab, Yonsei University](http://dsp.yonsei.ac.kr/).

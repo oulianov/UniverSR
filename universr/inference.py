@@ -204,6 +204,11 @@ class UniverSR(torch.nn.Module):
             # File is truly low-resolution; resample up to 48 kHz
             wav = torchaudio.functional.resample(wav, orig_freq=file_sr, new_freq=target_sr)
 
+        # Minimum length guard
+        MIN_SAMPLES = 32_768
+        original_len = wav.shape[-1]
+        wav = torch.nn.functional.pad(wav, (0, max(0, MIN_SAMPLES - wav.shape[-1])))
+
         # Ensure shape is [B, C, T] = [1, 1, T]
         if wav.dim() == 1:
             wav = wav.unsqueeze(0).unsqueeze(0)
@@ -216,7 +221,7 @@ class UniverSR(torch.nn.Module):
         output = self._inference(wav, sr_khz, ode_method, ode_steps, guidance_scale)
 
         # (1,T)
-        return output
+        return output[..., :original_len]
 
     # ------------------------------------------------------------------ #
     #  Internal methods                                                   #
