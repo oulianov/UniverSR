@@ -7,11 +7,9 @@ name = "universr"
 version = "0.1.0"
 description = "Unified and Versatile Audio Super-Resolution via Vocoder-Free Flow Matching"
 readme = "README.md"
-license = {text = "MIT"}
+license = { text = "MIT" }
 requires-python = ">=3.10"
-authors = [
-    {name = "Woongjib Choi"},
-]
+authors = [{ name = "Woongjib Choi" }]
 keywords = ["audio", "super-resolution", "flow-matching", "speech", "music"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -25,6 +23,7 @@ classifiers = [
 dependencies = [
     "torch>=2.0",
     "torchaudio>=2.0",
+    "torchcodec>=0.1",
     "torchdiffeq>=0.2.3",
     "einops>=0.7",
     "timm>=0.9",
