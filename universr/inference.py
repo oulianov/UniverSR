@@ -3,7 +3,9 @@ UniverSR: Unified and Versatile Audio Super-Resolution via Vocoder-Free Flow Mat
 Inference wrapper module.
 """
 
+import logging
 import os
+import time
 from typing import Optional, Union
 
 import numpy as np
@@ -15,12 +17,14 @@ from huggingface_hub import hf_hub_download
 from universr.models.unet import ConvNeXtUNetCond
 from universr.flow.path import OriginalCFMPath
 from universr.flow.solver import CFGVectorFieldODE, VectorFieldODE, TorchDiffeqSolver
+from universr.utils.audio import load_audio_file
 from universr.utils.spectral_ops import AmplitudeCompressedComplexSTFT
 
 
 # Supported input sample rates (kHz) and their corresponding LR frequency bins
 SUPPORTED_INPUT_SR = {8000, 12000, 16000, 24000}
 TARGET_SR = 48000
+logger = logging.getLogger(__name__)
 
 
 class UniverSR(torch.nn.Module):
@@ -48,6 +52,27 @@ class UniverSR(torch.nn.Module):
         self.transform = transform
         self.path = path
         self._device = device
+        self.debug_logs = False
+
+    def _debug_logs_enabled(self) -> bool:
+        env_value = os.environ.get("UNIVERSR_DEBUG_LOGS", "").strip().lower()
+        return bool(self.debug_logs) or env_value in {"1", "true", "yes", "on"}
+
+    def _sync_timing_device(self) -> None:
+        if (
+            isinstance(self._device, str)
+            and self._device.startswith("cuda")
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.synchronize()
+
+    def _start_timing(self) -> float:
+        self._sync_timing_device()
+        return time.perf_counter()
+
+    def _finish_timing(self, started_at: float) -> float:
+        self._sync_timing_device()
+        return time.perf_counter() - started_at
 
     @classmethod
     def from_pretrained(
@@ -61,64 +86,16 @@ class UniverSR(torch.nn.Module):
 
         Args:
             repo_id_or_path: HuggingFace repo ID (e.g. "woongzip1/universr-speech")
-                             or local checkpoint path / directory containing config.yaml
-                             and a supported weights file.
+                             or local directory path containing config.yaml and pytorch_model.bin.
             device: Device to load the model on.
             revision: Optional HuggingFace revision (branch, tag, or commit hash).
 
         Returns:
             UniverSR instance ready for inference.
         """
-        is_local_path = os.path.isfile(repo_id_or_path) or os.path.isdir(
-            repo_id_or_path
-        )
-        if is_local_path:
-            if os.path.isfile(repo_id_or_path):
-                model_path = repo_id_or_path
-                base_dir = os.path.dirname(repo_id_or_path)
-            else:
-                base_dir = repo_id_or_path
-                preferred_names = (
-                    "pytorch_model.bin",
-                    "model.pth",
-                    "best_model.pth",
-                    "model.pt",
-                    "best_model.pt",
-                    "recent.pth",
-                    "recent.pt",
-                )
-                model_path = None
-                for name in preferred_names:
-                    candidate = os.path.join(base_dir, name)
-                    if os.path.isfile(candidate):
-                        model_path = candidate
-                        break
-                if model_path is None:
-                    checkpoint_files = sorted(
-                        entry.path
-                        for entry in os.scandir(base_dir)
-                        if entry.is_file()
-                        and entry.name.endswith((".bin", ".pth", ".pt"))
-                    )
-                    if len(checkpoint_files) == 1:
-                        model_path = checkpoint_files[0]
-                    elif checkpoint_files:
-                        raise FileNotFoundError(
-                            "Found multiple checkpoint files in the local model directory. "
-                            f"Please pass the checkpoint file directly instead: {checkpoint_files}"
-                        )
-                    else:
-                        raise FileNotFoundError(
-                            "Could not find model weights in the local model directory. "
-                            "Expected one of pytorch_model.bin, model.pth, best_model.pth, "
-                            "model.pt, best_model.pt, or recent.pth."
-                        )
-
-            config_path = os.path.join(base_dir, "config.yaml")
-            if not os.path.isfile(config_path):
-                raise FileNotFoundError(
-                    f"Could not find config.yaml next to the local checkpoint at {base_dir}."
-                )
+        if os.path.isdir(repo_id_or_path):
+            config_path = os.path.join(repo_id_or_path, "config.yaml")
+            model_path = os.path.join(repo_id_or_path, "pytorch_model.bin")
         else:
             config_path = hf_hub_download(
                 repo_id=repo_id_or_path, filename="config.yaml", revision=revision
@@ -133,13 +110,7 @@ class UniverSR(torch.nn.Module):
 
         # Build model
         model = ConvNeXtUNetCond(**config["model"])
-        state_dict = torch.load(
-            model_path,
-            map_location="cpu",
-            weights_only=not is_local_path,
-        )
-        if "model_state_dict" in state_dict:
-            state_dict = state_dict["model_state_dict"]
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
         model.load_state_dict(state_dict)
         model.to(device).eval()
 
@@ -296,7 +267,7 @@ class UniverSR(torch.nn.Module):
             (waveform, file_sr): The waveform tensor and its *actual* sample rate.
         """
         if isinstance(audio, str):
-            wav, file_sr = torchaudio.load(audio)
+            wav, file_sr = load_audio_file(audio)
             # Mix to mono if stereo
             if wav.shape[0] > 1:
                 wav = wav.mean(dim=0, keepdim=True)
@@ -380,18 +351,54 @@ class UniverSR(torch.nn.Module):
         5. Concatenate LR + generated HF
         6. iSTFT to waveform
         """
+        debug_logs_enabled = self._debug_logs_enabled()
+        stage_timings: dict[str, float] = {}
+        if debug_logs_enabled:
+            logger.info(
+                "[UniverSR] Inference start: input_shape=%s sr_khz=%s ode_method=%s "
+                "ode_steps=%s guidance_scale=%s device=%s",
+                tuple(lr_audio.shape),
+                sr_khz,
+                ode_method,
+                ode_steps,
+                guidance_scale,
+                self._device,
+            )
+            self.model.reset_forward_profile()
+            total_start = self._start_timing()
+
         # Frequency bin bookkeeping
         lr_bin_count = self.model.sr_to_lr_bins[sr_khz]
         hf_start_bin = self.model.total_freq_bins - self.model.hr_freq_bins
         orig_length = lr_audio.shape[-1]
 
         # STFT
+        if debug_logs_enabled:
+            preprocess_start = self._start_timing()
         Y = self._preprocess(lr_audio)  # [B, 2, F-1, T]
+        if debug_logs_enabled:
+            stage_timings["preprocess"] = self._finish_timing(preprocess_start)
+            logger.info(
+                "[UniverSR] Preprocess complete: spec_shape=%s lr_bin_count=%s hf_start_bin=%s",
+                tuple(Y.shape),
+                lr_bin_count,
+                hf_start_bin,
+            )
         Y_lr = Y[:, :, :lr_bin_count, :]  # LR condition
         Y_hr = Y[:, :, hf_start_bin:, :]  # HR target region (for shape reference)
 
         # Initial noise
+        if debug_logs_enabled:
+            sample_source_start = self._start_timing()
         x0 = self.path.sample_source(Y_hr).to(self._device)
+        if debug_logs_enabled:
+            stage_timings["sample_source"] = self._finish_timing(sample_source_start)
+            logger.info(
+                "[UniverSR] Source sampling complete: y_lr_shape=%s y_hr_shape=%s x0_shape=%s",
+                tuple(Y_lr.shape),
+                tuple(Y_hr.shape),
+                tuple(x0.shape),
+            )
 
         # Build ODE solver
         if guidance_scale is not None and guidance_scale > 0 and guidance_scale != 1.0:
@@ -404,15 +411,82 @@ class UniverSR(torch.nn.Module):
         ts = torch.linspace(0, 1, ode_steps + 1, device=self._device)
 
         # Solve ODE
+        if debug_logs_enabled:
+            ode_solve_start = self._start_timing()
         x1_spec = solver.simulate(
             x0, ts=ts, y=Y_lr, sr_values=torch.tensor([sr_khz], device=self._device)
         )
+        if debug_logs_enabled:
+            stage_timings["ode_solve"] = self._finish_timing(ode_solve_start)
+            logger.info(
+                "[UniverSR] ODE solve complete: ts_steps=%s x1_spec_shape=%s",
+                len(ts) - 1,
+                tuple(x1_spec.shape),
+            )
 
         # Concatenate LR bins + generated HF bins (handle overlapping region)
+        if debug_logs_enabled:
+            assemble_start = self._start_timing()
         slice_start = max(0, lr_bin_count - hf_start_bin)
         x1_spec = x1_spec[:, :, slice_start:, :]
         full_spec = torch.cat([Y_lr, x1_spec], dim=2)
+        if debug_logs_enabled:
+            stage_timings["assemble"] = self._finish_timing(assemble_start)
+            logger.info(
+                "[UniverSR] Spectrum assembly complete: slice_start=%s full_spec_shape=%s",
+                slice_start,
+                tuple(full_spec.shape),
+            )
 
         # iSTFT
+        if debug_logs_enabled:
+            postprocess_start = self._start_timing()
         output = self._postprocess(full_spec, orig_length=orig_length)
+        if debug_logs_enabled:
+            stage_timings["postprocess"] = self._finish_timing(postprocess_start)
+            stage_timings["total"] = self._finish_timing(total_start)
+            logger.info(
+                "[UniverSR] Postprocess complete: output_shape=%s orig_length=%s",
+                tuple(output.shape),
+                orig_length,
+            )
+            logger.info(
+                "[UniverSR] Stage timings: preprocess=%.3fs sample_source=%.3fs "
+                "ode_solve=%.3fs assemble=%.3fs postprocess=%.3fs total=%.3fs",
+                stage_timings.get("preprocess", 0.0),
+                stage_timings.get("sample_source", 0.0),
+                stage_timings.get("ode_solve", 0.0),
+                stage_timings.get("assemble", 0.0),
+                stage_timings.get("postprocess", 0.0),
+                stage_timings.get("total", 0.0),
+            )
+
+            forward_profile = self.model.consume_forward_profile()
+            if forward_profile["calls"] > 0:
+                forward_total_s = float(sum(forward_profile["totals"].values()))
+                logger.info(
+                    "[UniverSR] Forward summary: calls=%s total=%.3fs avg=%.3fs",
+                    forward_profile["calls"],
+                    forward_total_s,
+                    forward_total_s / max(1, forward_profile["calls"]),
+                )
+                top_stages = sorted(
+                    forward_profile["totals"].items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:8]
+                if top_stages:
+                    stage_parts = ", ".join(
+                        (
+                            f"{name}={elapsed_s:.3f}s "
+                            f"({(elapsed_s / max(forward_total_s, 1e-9)) * 100.0:.1f}%)"
+                        )
+                        for name, elapsed_s in top_stages
+                    )
+                    logger.info("[UniverSR] Top forward stages: %s", stage_parts)
+                    logger.info(
+                        "[UniverSR] Bottleneck stage: %s at %.3fs",
+                        top_stages[0][0],
+                        top_stages[0][1],
+                    )
         return output

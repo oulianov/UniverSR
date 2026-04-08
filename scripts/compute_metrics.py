@@ -19,6 +19,7 @@ import json
 import os
 from glob import glob
 
+import soundfile as sf
 import torch
 import torchaudio
 from tqdm import tqdm
@@ -52,11 +53,12 @@ def find_file_pairs(reference_dir, output_dir):
 
 def load_audio(path, target_sr):
     """Load and preprocess audio to mono at target sample rate."""
-    wav, sr = torchaudio.load(path)
-    if sr != target_sr:
-        wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=target_sr)
+    audio, sr = sf.read(path, dtype="float32", always_2d=True)
+    wav = torch.from_numpy(audio.T.copy())
     if wav.shape[0] > 1:
         wav = wav.mean(dim=0, keepdim=True)
+    if sr != target_sr:
+        wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=target_sr)
     return wav
 
 

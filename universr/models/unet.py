@@ -1,4 +1,8 @@
+from collections import defaultdict
+import logging
 import math
+import os
+import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -7,6 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from timm.models.layers import DropPath, trunc_normal_
+
+logger = logging.getLogger(__name__)
 
 class ConditionalVectorFieldModel(nn.Module, ABC):
     """
@@ -329,6 +335,8 @@ class ConvNeXtUNetCond(ConditionalVectorFieldModel):
             self.decoders.append(DecoderBlock(dim_in, dim_out, depths[i], drop_path, time_dim))
         
         self.final_conv = nn.Conv2d(dims[0], out_channels, kernel_size=1)
+        self.debug_logs = False
+        self._forward_profile: Optional[dict[str, object]] = None
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -350,6 +358,40 @@ class ConvNeXtUNetCond(ConditionalVectorFieldModel):
         assert x.shape[-1] % self.strides == 0, \
             f"After padding, time dim:{x.shape(-1)} must be multiples of {self.strides}"        
         return x, pad_len
+
+    def _debug_logs_enabled(self) -> bool:
+        env_value = os.environ.get("UNIVERSR_DEBUG_LOGS", "").strip().lower()
+        return bool(self.debug_logs) or env_value in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _sync_timing_device(device: torch.device) -> None:
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+
+    def _start_timing(self, device: torch.device) -> float:
+        self._sync_timing_device(device)
+        return time.perf_counter()
+
+    def _finish_timing(self, started_at: float, device: torch.device) -> float:
+        self._sync_timing_device(device)
+        return time.perf_counter() - started_at
+
+    def reset_forward_profile(self) -> None:
+        self._forward_profile = {
+            "calls": 0,
+            "totals": defaultdict(float),
+        }
+
+    def consume_forward_profile(self) -> dict[str, object]:
+        if self._forward_profile is None:
+            return {"calls": 0, "totals": {}}
+
+        profile = {
+            "calls": int(self._forward_profile["calls"]),
+            "totals": dict(self._forward_profile["totals"]),
+        }
+        self._forward_profile = None
+        return profile
         
     def forward(self, x, t, y, sr_values):
         """
@@ -358,13 +400,40 @@ class ConvNeXtUNetCond(ConditionalVectorFieldModel):
         y : condition lr spectrum [B,2,F,T]
         sr_values: input sampling_rate [B] or [1] 
         """
+        debug_logs_enabled = self._debug_logs_enabled()
+        profile = self._forward_profile
+        if debug_logs_enabled and profile is None:
+            self.reset_forward_profile()
+            profile = self._forward_profile
+            ephemeral_profile = True
+        else:
+            ephemeral_profile = False
+
+        if debug_logs_enabled:
+            stage_timings = defaultdict(float)
+            first_call = int(profile["calls"]) == 0 if profile is not None else True
+            if first_call:
+                logger.info(
+                    "[UniverSR] Forward[1] start: x=%s t=%s y=%s sr_values=%s",
+                    tuple(x.shape),
+                    tuple(t.shape),
+                    None if y is None else tuple(y.shape),
+                    sr_values.tolist() if hasattr(sr_values, "tolist") else sr_values,
+                )
+
         # Pad logic
+        if debug_logs_enabled:
+            stage_start = self._start_timing(x.device)
         x, pad_len = self._pad_frames(x)
         if pad_len > 0 and y is not None:
             y = torch.nn.functional.pad(y, [0, pad_len, 0, 0], mode='reflect')
         B, _, F, T = x.shape
+        if debug_logs_enabled:
+            stage_timings["pad_and_align"] += self._finish_timing(stage_start, x.device)
         
         # get number of lr bins for input sr
+        if debug_logs_enabled:
+            stage_start = self._start_timing(x.device)
         if isinstance(sr_values, int):
             current_sr = sr_values
         else:
@@ -383,7 +452,11 @@ class ConvNeXtUNetCond(ConditionalVectorFieldModel):
         sr_idx = self.sr_to_idx[current_sr]
         sr_emb = self.sr_embedder(torch.tensor([sr_idx], device=x.device)).expand(B,-1) # [B, D]
         t_embed = t_embed + self.sr_projector(sr_emb) # [B, timedim]
+        if debug_logs_enabled:
+            stage_timings["condition_setup"] += self._finish_timing(stage_start, x.device)
         
+        if debug_logs_enabled:
+            stage_start = self._start_timing(x.device)
         if y is not None:    # (Training) 
             y_cond_real = self.conditioning_encoder(y, pe_low, sr_emb)   # [B,D,T]    
             # Uncond token masking
@@ -396,10 +469,14 @@ class ConvNeXtUNetCond(ConditionalVectorFieldModel):
                 y_cond = y_cond_real
         else: # Unconditional (inference)
             y_cond = self.uncond_emb.reshape(1,self.cond_dim,1).expand(B,self.cond_dim,T)
+        if debug_logs_enabled:
+            stage_timings["conditioning_encoder"] += self._finish_timing(stage_start, x.device)
 
         y_cond = y_cond.unsqueeze(2)                            # [B,D,1,T]
                 
         # FiLM Conditioning of freq-bins
+        if debug_logs_enabled:
+            stage_start = self._start_timing(x.device)
         film_params = self.film_generator(pe_high) # [F2,D] -> [F2,2D]
         gamma_high, beta_high = torch.chunk(film_params, chunks=2, dim=-1) # [F2, D]
         gamma_high = rearrange(gamma_high, 'f d -> 1 d f 1') # [1,D,F2,1]
@@ -407,30 +484,79 @@ class ConvNeXtUNetCond(ConditionalVectorFieldModel):
         spatial_cond = y_cond * gamma_high + beta_high # [B,D,F2,T]
         
         x = torch.cat([x, spatial_cond], dim=1) # [B,2+D,F2,T]
+        if debug_logs_enabled:
+            stage_timings["film_and_concat"] += self._finish_timing(stage_start, x.device)
 
+        if debug_logs_enabled:
+            stage_start = self._start_timing(x.device)
         x = self.init_conv(x)
+        if debug_logs_enabled:
+            stage_timings["init_conv"] += self._finish_timing(stage_start, x.device)
         skip_connections = [x]
         
-        for encoder in self.encoders:
+        for idx, encoder in enumerate(self.encoders):
+            if debug_logs_enabled:
+                stage_start = self._start_timing(x.device)
             x = encoder(x, t_embed)
+            if debug_logs_enabled:
+                stage_timings[f"encoder_{idx}"] += self._finish_timing(stage_start, x.device)
             skip_connections.append(x)
         
+        if debug_logs_enabled:
+            stage_start = self._start_timing(x.device)
         x = self.midcoder(x, t_embed)
+        if debug_logs_enabled:
+            stage_timings["midcoder"] += self._finish_timing(stage_start, x.device)
 
-        for decoder in self.decoders:
+        for idx, decoder in enumerate(self.decoders):
             skip = skip_connections.pop()
             if x.shape != skip.shape:
                 x = nn.functional.interpolate(x, size=skip.shape[2:])
+            if debug_logs_enabled:
+                stage_start = self._start_timing(x.device)
             x = x + skip
             x = decoder(x, t_embed)
+            if debug_logs_enabled:
+                stage_timings[f"decoder_{idx}"] += self._finish_timing(stage_start, x.device)
 
         skip = skip_connections.pop()
         x = x + skip
+        if debug_logs_enabled:
+            stage_start = self._start_timing(x.device)
         x = self.final_conv(x)
+        if debug_logs_enabled:
+            stage_timings["final_conv"] += self._finish_timing(stage_start, x.device)
 
         # Crop out
+        if debug_logs_enabled:
+            stage_start = self._start_timing(x.device)
         if pad_len:
             x = x[...,:-pad_len]
+        if debug_logs_enabled:
+            stage_timings["crop"] += self._finish_timing(stage_start, x.device)
+
+            if profile is not None:
+                profile["calls"] += 1
+                for stage_name, elapsed_s in stage_timings.items():
+                    profile["totals"][stage_name] += elapsed_s
+
+            if first_call:
+                logger.info(
+                    "[UniverSR] Forward[1] output: %s pad_len=%s current_sr=%s",
+                    tuple(x.shape),
+                    pad_len,
+                    current_sr,
+                )
+                logger.info(
+                    "[UniverSR] Forward[1] timings: %s",
+                    ", ".join(
+                        f"{stage_name}={elapsed_s:.3f}s"
+                        for stage_name, elapsed_s in stage_timings.items()
+                    ),
+                )
+
+            if ephemeral_profile:
+                self._forward_profile = None
         return x
 
 def main():

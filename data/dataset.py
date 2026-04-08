@@ -7,6 +7,7 @@ import torch
 import torchaudio
 from torch.utils.data import DataLoader
 
+from universr.utils.audio import load_audio_file
 from universr.utils.utils import _worker_init_fn, read_file_list
 
 
@@ -79,7 +80,7 @@ class Dataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         wb_path = self.wb_paths[idx]
-        y, sr = torchaudio.load(wb_path)
+        y, sr = load_audio_file(wb_path)
         if y.size(0) > 1:
             y = y.mean(dim=0, keepdim=True)
     
