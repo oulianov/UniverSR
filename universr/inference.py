@@ -61,16 +61,64 @@ class UniverSR(torch.nn.Module):
 
         Args:
             repo_id_or_path: HuggingFace repo ID (e.g. "woongzip1/universr-speech")
-                             or local directory path containing config.yaml and pytorch_model.bin.
+                             or local checkpoint path / directory containing config.yaml
+                             and a supported weights file.
             device: Device to load the model on.
             revision: Optional HuggingFace revision (branch, tag, or commit hash).
 
         Returns:
             UniverSR instance ready for inference.
         """
-        if os.path.isdir(repo_id_or_path):
-            config_path = os.path.join(repo_id_or_path, "config.yaml")
-            model_path = os.path.join(repo_id_or_path, "pytorch_model.bin")
+        is_local_path = os.path.isfile(repo_id_or_path) or os.path.isdir(
+            repo_id_or_path
+        )
+        if is_local_path:
+            if os.path.isfile(repo_id_or_path):
+                model_path = repo_id_or_path
+                base_dir = os.path.dirname(repo_id_or_path)
+            else:
+                base_dir = repo_id_or_path
+                preferred_names = (
+                    "pytorch_model.bin",
+                    "model.pth",
+                    "best_model.pth",
+                    "model.pt",
+                    "best_model.pt",
+                    "recent.pth",
+                    "recent.pt",
+                )
+                model_path = None
+                for name in preferred_names:
+                    candidate = os.path.join(base_dir, name)
+                    if os.path.isfile(candidate):
+                        model_path = candidate
+                        break
+                if model_path is None:
+                    checkpoint_files = sorted(
+                        entry.path
+                        for entry in os.scandir(base_dir)
+                        if entry.is_file()
+                        and entry.name.endswith((".bin", ".pth", ".pt"))
+                    )
+                    if len(checkpoint_files) == 1:
+                        model_path = checkpoint_files[0]
+                    elif checkpoint_files:
+                        raise FileNotFoundError(
+                            "Found multiple checkpoint files in the local model directory. "
+                            f"Please pass the checkpoint file directly instead: {checkpoint_files}"
+                        )
+                    else:
+                        raise FileNotFoundError(
+                            "Could not find model weights in the local model directory. "
+                            "Expected one of pytorch_model.bin, model.pth, best_model.pth, "
+                            "model.pt, best_model.pt, or recent.pth."
+                        )
+
+            config_path = os.path.join(base_dir, "config.yaml")
+            if not os.path.isfile(config_path):
+                raise FileNotFoundError(
+                    f"Could not find config.yaml next to the local checkpoint at {base_dir}."
+                )
         else:
             config_path = hf_hub_download(
                 repo_id=repo_id_or_path, filename="config.yaml", revision=revision
@@ -85,7 +133,13 @@ class UniverSR(torch.nn.Module):
 
         # Build model
         model = ConvNeXtUNetCond(**config["model"])
-        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+        state_dict = torch.load(
+            model_path,
+            map_location="cpu",
+            weights_only=not is_local_path,
+        )
+        if "model_state_dict" in state_dict:
+            state_dict = state_dict["model_state_dict"]
         model.load_state_dict(state_dict)
         model.to(device).eval()
 
@@ -110,8 +164,9 @@ class UniverSR(torch.nn.Module):
         Load UniverSR from a local checkpoint (e.g. training checkpoint with optimizer state).
 
         This handles the standard training checkpoint format where weights are stored
-        under the 'model_state_dict' key, as opposed to from_pretrained() which expects
-        a clean state_dict saved as pytorch_model.bin.
+        under the 'model_state_dict' key. from_pretrained() can also load local
+        checkpoints, but this constructor is still useful when the config path
+        needs to be provided explicitly.
 
         Args:
             ckpt_path: Path to checkpoint file (.pth).
@@ -202,7 +257,9 @@ class UniverSR(torch.nn.Module):
             wav = self._apply_bandwidth_limit(wav, effective_sr, target_sr)
         elif file_sr != target_sr:
             # File is truly low-resolution; resample up to 48 kHz
-            wav = torchaudio.functional.resample(wav, orig_freq=file_sr, new_freq=target_sr)
+            wav = torchaudio.functional.resample(
+                wav, orig_freq=file_sr, new_freq=target_sr
+            )
 
         # Minimum length guard
         MIN_SAMPLES = 32_768
@@ -228,7 +285,9 @@ class UniverSR(torch.nn.Module):
     # ------------------------------------------------------------------ #
 
     def _load_audio(
-        self, audio: Union[str, torch.Tensor, np.ndarray], input_sr: Optional[int] = None,
+        self,
+        audio: Union[str, torch.Tensor, np.ndarray],
+        input_sr: Optional[int] = None,
     ) -> tuple:
         """
         Load and validate audio input.
@@ -254,7 +313,10 @@ class UniverSR(torch.nn.Module):
         raise TypeError(f"Unsupported audio type: {type(audio)}")
 
     def _apply_bandwidth_limit(
-        self, wav: torch.Tensor, effective_sr: int, target_sr: int,
+        self,
+        wav: torch.Tensor,
+        effective_sr: int,
+        target_sr: int,
     ) -> torch.Tensor:
         """
         Simulate low-resolution input from a high-sample-rate waveform.
@@ -272,8 +334,12 @@ class UniverSR(torch.nn.Module):
             Bandwidth-limited waveform at target_sr, same length as input.
         """
         original_len = wav.shape[-1]
-        lr = torchaudio.functional.resample(wav, orig_freq=target_sr, new_freq=effective_sr)
-        lr = torchaudio.functional.resample(lr, orig_freq=effective_sr, new_freq=target_sr)
+        lr = torchaudio.functional.resample(
+            wav, orig_freq=target_sr, new_freq=effective_sr
+        )
+        lr = torchaudio.functional.resample(
+            lr, orig_freq=effective_sr, new_freq=target_sr
+        )
         return lr[..., :original_len]
 
     def _preprocess(self, waveform: torch.Tensor) -> torch.Tensor:
@@ -281,20 +347,20 @@ class UniverSR(torch.nn.Module):
         Convert waveform to amplitude-compressed complex STFT representation.
         [B, C, T] -> [B, 2, F-1, T_frames]  (real/imag channels, drop Nyquist bin)
         """
-        spec = self.transform(waveform)              # [B, C, F, T_frames] complex
-        real = torch.view_as_real(spec.squeeze(1))    # [B, F, T_frames, 2]
-        real = real.permute(0, 3, 1, 2)               # [B, 2, F, T_frames]
-        return real[:, :, :-1, :]                      # drop Nyquist bin
+        spec = self.transform(waveform)  # [B, C, F, T_frames] complex
+        real = torch.view_as_real(spec.squeeze(1))  # [B, F, T_frames, 2]
+        real = real.permute(0, 3, 1, 2)  # [B, 2, F, T_frames]
+        return real[:, :, :-1, :]  # drop Nyquist bin
 
-    def _postprocess(self, spec: torch.Tensor) -> torch.Tensor:
+    def _postprocess(self, spec: torch.Tensor, orig_length: int) -> torch.Tensor:
         """
         Convert STFT representation back to waveform.
         [B, 2, F-1, T_frames] -> [B, T]
         """
         spec = torch.nn.functional.pad(spec, [0, 0, 0, 1], value=0)  # restore Nyquist
-        spec = spec.permute(0, 2, 3, 1).contiguous()                  # [B, F, T, 2]
-        spec = torch.view_as_complex(spec)                             # [B, F, T] complex
-        waveform = self.transform.invert(spec)                         # [B, T]
+        spec = spec.permute(0, 2, 3, 1).contiguous()  # [B, F, T, 2]
+        spec = torch.view_as_complex(spec)  # [B, F, T] complex
+        waveform = self.transform.invert(spec, orig_length=orig_length)  # [B, T]
         return waveform
 
     def _inference(
@@ -317,17 +383,18 @@ class UniverSR(torch.nn.Module):
         # Frequency bin bookkeeping
         lr_bin_count = self.model.sr_to_lr_bins[sr_khz]
         hf_start_bin = self.model.total_freq_bins - self.model.hr_freq_bins
+        orig_length = lr_audio.shape[-1]
 
         # STFT
-        Y = self._preprocess(lr_audio)          # [B, 2, F-1, T]
-        Y_lr = Y[:, :, :lr_bin_count, :]         # LR condition
-        Y_hr = Y[:, :, hf_start_bin:, :]         # HR target region (for shape reference)
+        Y = self._preprocess(lr_audio)  # [B, 2, F-1, T]
+        Y_lr = Y[:, :, :lr_bin_count, :]  # LR condition
+        Y_hr = Y[:, :, hf_start_bin:, :]  # HR target region (for shape reference)
 
         # Initial noise
         x0 = self.path.sample_source(Y_hr).to(self._device)
 
         # Build ODE solver
-        if guidance_scale is not None and guidance_scale > 0:
+        if guidance_scale is not None and guidance_scale > 0 and guidance_scale != 1.0:
             ode = CFGVectorFieldODE(net=self.model, guidance_scale=guidance_scale)
         else:
             ode = VectorFieldODE(net=self.model)
@@ -347,5 +414,5 @@ class UniverSR(torch.nn.Module):
         full_spec = torch.cat([Y_lr, x1_spec], dim=2)
 
         # iSTFT
-        output = self._postprocess(full_spec)
+        output = self._postprocess(full_spec, orig_length=orig_length)
         return output

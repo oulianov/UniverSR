@@ -86,7 +86,12 @@ class CFGVectorFieldODE(ODE):
         
     def drift_coefficient(self, xt: torch.Tensor, t: torch.Tensor, y: torch.Tensor, **kwargs) -> torch.Tensor:
         guided_vector_field = self.net(xt, t, y, **kwargs)
+        if self.guidance_scale == 1.0:
+            return guided_vector_field
+
         unguided_vector_field = self.net(xt, t, None, **kwargs)
+        if self.guidance_scale == 0.0:
+            return unguided_vector_field
         
         return (1-self.guidance_scale) * unguided_vector_field + self.guidance_scale * guided_vector_field
 

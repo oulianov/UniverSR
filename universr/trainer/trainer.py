@@ -101,11 +101,16 @@ class Trainer(ABC):
         if self.optimizer is None:
             raise RuntimeError("Optimizer must be initialized before loading a checkpoint.")
 
-        checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
         if 'model_state_dict' in checkpoint:
             self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.to(self.device)
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            for state in self.optimizer.state.values():
+                for key, value in state.items():
+                    if torch.is_tensor(value):
+                        state[key] = value.to(self.device)
             self.start_epoch = checkpoint['epoch'] + 1
             self.best_loss = checkpoint.get('best_loss', float('inf'))
             if self.scheduler and 'scheduler_state_dict' in checkpoint:
@@ -113,16 +118,17 @@ class Trainer(ABC):
             print(f"Training checkpoint loaded from {ckpt_path}. Resuming from epoch {self.start_epoch}.")
         else:
             self.model.load_state_dict(checkpoint)
+            self.model.to(self.device)
             print(f"Model weights loaded from {ckpt_path}. Starting training from epoch 1.")
 
     @staticmethod
     def load_model_for_inference(model, ckpt_path, device='cuda'):
-        model.to(device)
-        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         if "model_state_dict" in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
         else:
             model.load_state_dict(checkpoint)
+        model.to(device)
         model.eval()
         print(f"Model loaded from {ckpt_path}")
         return model
@@ -264,12 +270,12 @@ class STFTTrainer(Trainer):
         real = real.permute(0, 3, 1, 2)
         return real[:, :, :-1, :]
 
-    def _postprocess(self, spec):
+    def _postprocess(self, spec, orig_length):
         """real-valued STFT [B,2,F,T] -> waveform [B,T]"""
         spec = torch.nn.functional.pad(spec, pad=[0, 0, 0, 1], value=0)
         spec = spec.permute(0, 2, 3, 1).contiguous()
         spec = torch.view_as_complex(spec)
-        return self.transform.invert(spec)
+        return self.transform.invert(spec, orig_length=orig_length)
 
     def _get_freq_bins(self, sr_value):
         """Return (lr_bin_count, hf_start_bin) for a given sampling rate."""
@@ -294,7 +300,7 @@ class STFTTrainer(Trainer):
     # ------------------------------------------------------------------ #
     def _run_ode(self, Y_lr, Y_hr, sr_values, ode_steps, guidance_scale=None):
         """Run ODE sampling in the HR spectral region."""
-        if guidance_scale is not None and guidance_scale != 0:
+        if guidance_scale is not None and guidance_scale != 0 and guidance_scale != 1.0:
             ode = CFGVectorFieldODE(net=self.model, guidance_scale=float(guidance_scale))
         else:
             ode = VectorFieldODE(net=self.model)
@@ -304,11 +310,11 @@ class STFTTrainer(Trainer):
         return solver.simulate(x0, ts, y=Y_lr, sr_values=sr_values)
 
     def _synthesize_waveform(self, Y_lr, Y_hr, sr_values, lr_bin_count, hf_start_bin,
-                             ode_steps, guidance_scale=None):
+                             ode_steps, guidance_scale=None, orig_length=None):
         """Full pipeline: ODE sampling -> spectral assembly -> waveform."""
         x1_hr = self._run_ode(Y_lr, Y_hr, sr_values, ode_steps, guidance_scale)
         x1_full = self._assemble_fullband(Y_lr, x1_hr, lr_bin_count, hf_start_bin)
-        return self._postprocess(x1_full)
+        return self._postprocess(x1_full, orig_length=orig_length)
 
     # ------------------------------------------------------------------ #
     #  Metrics
@@ -429,7 +435,8 @@ class STFTTrainer(Trainer):
         lsd_high = None
         with torch.no_grad():
             x1_wave = self._synthesize_waveform(
-                Y_lr, Y_hr, sr_values, lr_bin_count, hf_start_bin, ode_steps)
+                Y_lr, Y_hr, sr_values, lr_bin_count, hf_start_bin, ode_steps,
+                orig_length=z.shape[-1])
             _, lsd_high, _ = self._compute_lsd(
                 x1_wave, z[..., :x1_wave.shape[-1]], current_sr)
             lsd_high = float(lsd_high)
@@ -442,7 +449,7 @@ class STFTTrainer(Trainer):
                     Y[0:1, :, :lr_bin_count, :],
                     Y[0:1, :, hf_start_bin:, :],
                     sr_values, lr_bin_count, hf_start_bin,
-                    ode_steps, guidance_scale=1.5)
+                    ode_steps, guidance_scale=1.5, orig_length=z[0:1].shape[-1])
 
                 min_len = min(z.shape[-1], x1_wave_cfg.shape[-1])
                 log_payload = self._build_sample_log(
@@ -518,7 +525,8 @@ class STFTTrainer(Trainer):
 
         # ODE synthesis
         x1_wave = self._synthesize_waveform(
-            Y_lr, Y_hr, sr_values, lr_bin_count, hf_start_bin, ode_steps, guidance_scale)
+            Y_lr, Y_hr, sr_values, lr_bin_count, hf_start_bin, ode_steps, guidance_scale,
+            orig_length=z.shape[-1])
 
         min_len = min(z.shape[-1], x1_wave.shape[-1])
         z_c = z[..., :min_len]
@@ -570,4 +578,3 @@ class STFTTrainer(Trainer):
 
         if batch_idx < 3:
             print(f"Saved batch {batch_idx} samples under {self._eval_output_base}")
-
