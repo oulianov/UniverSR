@@ -80,28 +80,32 @@ class UniverSR(torch.nn.Module):
         repo_id_or_path: str,
         device: str = "cuda",
         revision: Optional[str] = None,
+        checkpoint_filename: str = "pytorch_model.bin",
     ) -> "UniverSR":
         """
         Load a pretrained UniverSR model.
 
         Args:
             repo_id_or_path: HuggingFace repo ID (e.g. "woongzip1/universr-speech")
-                             or local directory path containing config.yaml and pytorch_model.bin.
+                             or local directory path containing config.yaml and checkpoint file.
             device: Device to load the model on.
             revision: Optional HuggingFace revision (branch, tag, or commit hash).
+            checkpoint_filename: Checkpoint filename to load from the repo or local directory.
 
         Returns:
             UniverSR instance ready for inference.
         """
         if os.path.isdir(repo_id_or_path):
             config_path = os.path.join(repo_id_or_path, "config.yaml")
-            model_path = os.path.join(repo_id_or_path, "pytorch_model.bin")
+            model_path = os.path.join(repo_id_or_path, checkpoint_filename)
         else:
             config_path = hf_hub_download(
                 repo_id=repo_id_or_path, filename="config.yaml", revision=revision
             )
             model_path = hf_hub_download(
-                repo_id=repo_id_or_path, filename="pytorch_model.bin", revision=revision
+                repo_id=repo_id_or_path,
+                filename=checkpoint_filename,
+                revision=revision,
             )
 
         # Load config
