@@ -6,7 +6,7 @@ Inference wrapper module.
 import logging
 import os
 import time
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 import numpy as np
 import torch
@@ -24,6 +24,8 @@ from universr.utils.spectral_ops import AmplitudeCompressedComplexSTFT
 # Supported input sample rates (kHz) and their corresponding LR frequency bins
 SUPPORTED_INPUT_SR = {8000, 12000, 16000, 24000}
 TARGET_SR = 48000
+RECONSTRUCTION_METHODS = {"original", "original_signal"}
+ReconstructionMethod = Literal["original", "original_signal"]
 logger = logging.getLogger(__name__)
 
 
@@ -185,6 +187,7 @@ class UniverSR(torch.nn.Module):
         ode_method: str = "midpoint",
         ode_steps: int = 4,
         guidance_scale: Optional[float] = 1.5,
+        reconstruction_method: ReconstructionMethod = "original",
     ) -> torch.Tensor:
         """
         Enhance a low-resolution audio signal to high-resolution.
@@ -203,11 +206,22 @@ class UniverSR(torch.nn.Module):
             ode_method: ODE solver method. One of 'euler', 'midpoint', 'rk4'.
             ode_steps: Number of ODE integration steps.
             guidance_scale: Classifier-free guidance scale. None or 0 disables CFG.
+            reconstruction_method: Spectrum assembly method. "original" keeps the
+                   legacy behavior and uses the bandwidth-limited model input for
+                   low-frequency reconstruction. "original_signal" keeps the
+                   bandwidth-limited signal as the model condition but uses the
+                   unfiltered 48 kHz input for the final low-frequency bins.
 
         Returns:
             Enhanced waveform tensor of shape (1,T) at target_sr.
         """
         # Load audio
+        if reconstruction_method not in RECONSTRUCTION_METHODS:
+            raise ValueError(
+                f"Unsupported reconstruction_method={reconstruction_method!r}. "
+                f"Supported methods: {sorted(RECONSTRUCTION_METHODS)}"
+            )
+
         wav, file_sr = self._load_audio(audio, input_sr=input_sr)
         wav = wav.to(self._device)
 
@@ -226,31 +240,57 @@ class UniverSR(torch.nn.Module):
                 f"Supported rates: {sorted(SUPPORTED_INPUT_SR)}"
             )
 
+        original_wav_48k = wav
+
         # Prepare the 48 kHz LR input for the model
         if file_sr == target_sr:
             # Simulate the training degradation: downsample → upsample to match
             wav = self._apply_bandwidth_limit(wav, effective_sr, target_sr)
         elif file_sr != target_sr:
             # File is truly low-resolution; resample up to 48 kHz
-            wav = torchaudio.functional.resample(
+            original_wav_48k = torchaudio.functional.resample(
                 wav, orig_freq=file_sr, new_freq=target_sr
             )
+            wav = original_wav_48k
 
         # Minimum length guard
         MIN_SAMPLES = 32_768
         original_len = wav.shape[-1]
         wav = torch.nn.functional.pad(wav, (0, max(0, MIN_SAMPLES - wav.shape[-1])))
+        if reconstruction_method == "original_signal":
+            if original_wav_48k.shape[-1] > wav.shape[-1]:
+                original_wav_48k = original_wav_48k[..., : wav.shape[-1]]
+            elif original_wav_48k.shape[-1] < wav.shape[-1]:
+                original_wav_48k = torch.nn.functional.pad(
+                    original_wav_48k,
+                    (0, wav.shape[-1] - original_wav_48k.shape[-1]),
+                )
 
         # Ensure shape is [B, C, T] = [1, 1, T]
         if wav.dim() == 1:
             wav = wav.unsqueeze(0).unsqueeze(0)
         elif wav.dim() == 2:
             wav = wav.unsqueeze(0)
+        if reconstruction_method == "original_signal":
+            if original_wav_48k.dim() == 1:
+                original_wav_48k = original_wav_48k.unsqueeze(0).unsqueeze(0)
+            elif original_wav_48k.dim() == 2:
+                original_wav_48k = original_wav_48k.unsqueeze(0)
 
         sr_khz = effective_sr // 1000
 
         # Run flow matching SR
-        output = self._inference(wav, sr_khz, ode_method, ode_steps, guidance_scale)
+        output = self._inference(
+            wav,
+            sr_khz,
+            ode_method,
+            ode_steps,
+            guidance_scale,
+            reconstruction_method=reconstruction_method,
+            reconstruction_audio=(
+                original_wav_48k if reconstruction_method == "original_signal" else None
+            ),
+        )
 
         # (1,T)
         return output[..., :original_len]
@@ -345,6 +385,8 @@ class UniverSR(torch.nn.Module):
         ode_method: str,
         ode_steps: int,
         guidance_scale: Optional[float],
+        reconstruction_method: ReconstructionMethod = "original",
+        reconstruction_audio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Core inference pipeline:
@@ -383,10 +425,12 @@ class UniverSR(torch.nn.Module):
         if debug_logs_enabled:
             stage_timings["preprocess"] = self._finish_timing(preprocess_start)
             logger.info(
-                "[UniverSR] Preprocess complete: spec_shape=%s lr_bin_count=%s hf_start_bin=%s",
+                "[UniverSR] Preprocess complete: spec_shape=%s lr_bin_count=%s "
+                "hf_start_bin=%s reconstruction_method=%s",
                 tuple(Y.shape),
                 lr_bin_count,
                 hf_start_bin,
+                reconstruction_method,
             )
         Y_lr = Y[:, :, :lr_bin_count, :]  # LR condition
         Y_hr = Y[:, :, hf_start_bin:, :]  # HR target region (for shape reference)
@@ -433,7 +477,24 @@ class UniverSR(torch.nn.Module):
             assemble_start = self._start_timing()
         slice_start = max(0, lr_bin_count - hf_start_bin)
         x1_spec = x1_spec[:, :, slice_start:, :]
-        full_spec = torch.cat([Y_lr, x1_spec], dim=2)
+        if reconstruction_method == "original":
+            full_spec = torch.cat([Y_lr, x1_spec], dim=2)
+        elif reconstruction_method == "original_signal":
+            if reconstruction_audio is None:
+                raise ValueError(
+                    "reconstruction_audio is required when "
+                    "reconstruction_method='original_signal'."
+                )
+            Y_reconstruction = self._preprocess(reconstruction_audio.to(self._device))
+            full_spec = torch.cat(
+                [Y_reconstruction[:, :, :lr_bin_count, :], x1_spec],
+                dim=2,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported reconstruction_method={reconstruction_method!r}. "
+                f"Supported methods: {sorted(RECONSTRUCTION_METHODS)}"
+            )
         if debug_logs_enabled:
             stage_timings["assemble"] = self._finish_timing(assemble_start)
             logger.info(
