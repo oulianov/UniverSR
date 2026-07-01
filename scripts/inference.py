@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument('--ode-method', type=str, default='midpoint',
                         choices=['euler', 'midpoint', 'rk4'], help="ODE solver method.")
     parser.add_argument('--guidance-scale', type=float, default=1.5, help="CFG guidance scale (None=disabled).")
-    parser.add_argument('--reconstruction-method', type=str, default='original',
+    parser.add_argument('--reconstruction-method', type=str, default='original_signal',
                         choices=['original', 'original_signal'],
                         help="Spectrum assembly method. original keeps legacy behavior; original_signal preserves original low-frequency bins.")
     parser.add_argument('--device', type=str, default='cuda', choices=['cuda', 'cpu'])

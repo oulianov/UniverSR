@@ -187,7 +187,7 @@ class UniverSR(torch.nn.Module):
         ode_method: str = "midpoint",
         ode_steps: int = 4,
         guidance_scale: Optional[float] = 1.5,
-        reconstruction_method: ReconstructionMethod = "original",
+        reconstruction_method: ReconstructionMethod = "original_signal",
     ) -> torch.Tensor:
         """
         Enhance a low-resolution audio signal to high-resolution.
@@ -385,7 +385,7 @@ class UniverSR(torch.nn.Module):
         ode_method: str,
         ode_steps: int,
         guidance_scale: Optional[float],
-        reconstruction_method: ReconstructionMethod = "original",
+        reconstruction_method: ReconstructionMethod = "original_signal",
         reconstruction_audio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
