@@ -4,6 +4,7 @@ import resource
 import shutil
 import time
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -114,9 +115,15 @@ class CSVTrainingMonitor:
         "epoch_step",
         "loss",
         "cfm_loss",
+        "aux_highband_loss",
+        "aux_highband_weighted",
         "lsd_total",
         "lsd_high",
         "lsd_low",
+        "low_copy_lsd",
+        "wave_lsd_total",
+        "wave_lsd_high",
+        "wave_lsd_low",
         "data_seconds",
         "compute_seconds",
         "samples_per_second",
@@ -202,6 +209,10 @@ class CSVValidationTrackMonitor:
         "lsd_total",
         "lsd_high",
         "lsd_low",
+        "low_copy_lsd",
+        "wave_lsd_total",
+        "wave_lsd_high",
+        "wave_lsd_low",
         "data_seconds",
         "compute_seconds",
         "val_max_sec",
@@ -261,6 +272,10 @@ class CSVValidationTrackMonitor:
         lsd_total: float | str,
         lsd_high: float | str,
         lsd_low: float | str,
+        low_copy_lsd: float | str,
+        wave_lsd_total: float | str,
+        wave_lsd_high: float | str,
+        wave_lsd_low: float | str,
         data_seconds: float,
         compute_seconds: float,
         lr: float,
@@ -304,6 +319,10 @@ class CSVValidationTrackMonitor:
                 "lsd_total": self._value_at(lsd_total, sample_index),
                 "lsd_high": self._value_at(lsd_high, sample_index),
                 "lsd_low": self._value_at(lsd_low, sample_index),
+                "low_copy_lsd": self._value_at(low_copy_lsd, sample_index),
+                "wave_lsd_total": self._value_at(wave_lsd_total, sample_index),
+                "wave_lsd_high": self._value_at(wave_lsd_high, sample_index),
+                "wave_lsd_low": self._value_at(wave_lsd_low, sample_index),
                 "data_seconds": data_seconds,
                 "compute_seconds": compute_seconds,
                 "val_max_sec": val_max_sec,
@@ -332,6 +351,14 @@ class Trainer(ABC):
         self.logger = logger
         self.checkpoint_global_step = None
         self.checkpoint_epoch_step = None
+        self.amp_enabled = False
+        self.amp_dtype = None
+        self.grad_scaler = None
+
+    def _autocast_context(self):
+        if not self.amp_enabled:
+            return nullcontext()
+        return torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype)
 
     @abstractmethod
     def _train_step(self, **kwargs) -> torch.Tensor:
@@ -341,7 +368,10 @@ class Trainer(ABC):
         pass
 
     def get_optimizer(self, config):
-        return torch.optim.Adam(self.model.parameters(), **config)
+        trainable_params = [parameter for parameter in self.model.parameters() if parameter.requires_grad]
+        if not trainable_params:
+            raise RuntimeError("No trainable model parameters found for the optimizer.")
+        return torch.optim.Adam(trainable_params, **config)
 
     def get_scheduler(self, optimizer, config):
         scheduler_type = config.get('type', 'CosineLR')
@@ -364,21 +394,56 @@ class Trainer(ABC):
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_loss': self.best_loss,
         }
+        if getattr(self.model, "lora_config", None):
+            state['lora_config'] = dict(getattr(self.model, "lora_config"))
+            state['lora_target_modules'] = list(getattr(self.model, "lora_target_modules", []))
         if global_step is not None:
             state['global_step'] = int(global_step)
         if epoch_step is not None:
             state['epoch_step'] = int(epoch_step)
         if self.scheduler:
             state['scheduler_state_dict'] = self.scheduler.state_dict()
+        if self.grad_scaler is not None and self.grad_scaler.is_enabled():
+            state['amp_scaler_state_dict'] = self.grad_scaler.state_dict()
 
         ckpt_path = os.path.join(save_dir, filename or 'recent.pth')
         torch.save(state, ckpt_path)
         print(f"Checkpoint saved at epoch {epoch}: {ckpt_path}")
+        self._save_lora_checkpoint(save_dir, filename or 'recent.pth')
 
         if is_best:
             best_path = os.path.join(save_dir, 'best_model.pth')
             shutil.copyfile(ckpt_path, best_path)
+            self._save_lora_checkpoint(save_dir, 'best_model.pth', adapter_filename='best_lora.pt')
             print(f"Best model updated at epoch {epoch} (loss={self.best_loss:.6f})")
+
+    def _save_lora_checkpoint(self, save_dir, full_checkpoint_filename, adapter_filename=None):
+        if not getattr(self.model, "lora_config", None):
+            return
+        from universr.models.lora import lora_state_dict
+
+        adapter_state = lora_state_dict(self.model)
+        if not adapter_state:
+            return
+        full_stem = Path(full_checkpoint_filename).stem
+        adapter_name = adapter_filename or f"{full_stem}_lora.pt"
+        adapter_path = os.path.join(save_dir, adapter_name)
+        metadata = dict(getattr(self.model, "lora_metadata", {}))
+        metadata.setdefault("rank", getattr(self.model, "lora_config", {}).get("rank"))
+        metadata.setdefault("alpha", getattr(self.model, "lora_config", {}).get("alpha"))
+        metadata.setdefault("dropout", getattr(self.model, "lora_config", {}).get("dropout"))
+        metadata.setdefault("target", getattr(self.model, "lora_config", {}).get("target"))
+        metadata.setdefault("include_patterns", getattr(self.model, "lora_config", {}).get("include_patterns", []))
+        metadata.setdefault("exclude_patterns", getattr(self.model, "lora_config", {}).get("exclude_patterns", []))
+        metadata.setdefault("target_modules", list(getattr(self.model, "lora_target_modules", [])))
+        torch.save(
+            {
+                "lora_state_dict": adapter_state,
+                "metadata": metadata,
+            },
+            adapter_path,
+        )
+        print(f"LoRA adapter checkpoint saved: {adapter_path}")
 
     def load_checkpoint(self, ckpt_path):
         if not os.path.isfile(ckpt_path):
@@ -403,6 +468,8 @@ class Trainer(ABC):
             self.best_loss = checkpoint.get('best_loss', float('inf'))
             if self.scheduler and 'scheduler_state_dict' in checkpoint:
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if self.grad_scaler is not None and 'amp_scaler_state_dict' in checkpoint:
+                self.grad_scaler.load_state_dict(checkpoint['amp_scaler_state_dict'])
             resume_msg = f"Training checkpoint loaded from {ckpt_path}. Resuming from epoch {self.start_epoch}"
             if self.checkpoint_global_step is not None:
                 resume_msg += f", global step {self.checkpoint_global_step}"
@@ -434,12 +501,16 @@ class Trainer(ABC):
                  upscale_validation=False, validation_loss_metric="loss",
                  upscale_chunk_sec=None, val_audio_output_dir=None,
                  val_audio_reference_once=False, val_guidance_scale=None,
-                 val_reconstruction_method="original"):
+                 val_reconstruction_method="original", validation_seed=None):
         self.model.eval()
         total_val_loss = 0.0
         total_lsd_total = 0.0
         total_lsd_high = 0.0
         total_lsd_low = 0.0
+        total_low_copy_lsd = 0.0
+        total_wave_lsd_total = 0.0
+        total_wave_lsd_high = 0.0
+        total_wave_lsd_low = 0.0
         total_samples = 0
         total_data_seconds = 0.0
         total_compute_seconds = 0.0
@@ -457,17 +528,37 @@ class Trainer(ABC):
                 batch = next(val_iter)
                 data_seconds = time.perf_counter() - data_start
                 compute_start = time.perf_counter()
-                outdict = self._val_step(batch, idx, val_idx,
-                                         ode_steps=ode_steps,
-                                         val_max_sec=val_max_sec,
-                                         upscale_validation=upscale_validation,
-                                         validation_loss_metric=validation_loss_metric,
-                                         upscale_chunk_sec=upscale_chunk_sec,
-                                         global_step=global_step,
-                                         val_audio_output_dir=val_audio_output_dir,
-                                         val_audio_reference_once=val_audio_reference_once,
-                                         guidance_scale=val_guidance_scale,
-                                         reconstruction_method=val_reconstruction_method)
+                if validation_seed is None:
+                    outdict = self._val_step(batch, idx, val_idx,
+                                             ode_steps=ode_steps,
+                                             val_max_sec=val_max_sec,
+                                             upscale_validation=upscale_validation,
+                                             validation_loss_metric=validation_loss_metric,
+                                             upscale_chunk_sec=upscale_chunk_sec,
+                                             global_step=global_step,
+                                             val_audio_output_dir=val_audio_output_dir,
+                                             val_audio_reference_once=val_audio_reference_once,
+                                             guidance_scale=val_guidance_scale,
+                                             reconstruction_method=val_reconstruction_method)
+                else:
+                    seed_devices = []
+                    if self.device.type == "cuda" and torch.cuda.is_available():
+                        seed_devices = [self.device.index if self.device.index is not None else torch.cuda.current_device()]
+                    with torch.random.fork_rng(devices=seed_devices, enabled=True):
+                        torch.manual_seed(int(validation_seed) + idx)
+                        if self.device.type == "cuda" and torch.cuda.is_available():
+                            torch.cuda.manual_seed(int(validation_seed) + idx)
+                        outdict = self._val_step(batch, idx, val_idx,
+                                                 ode_steps=ode_steps,
+                                                 val_max_sec=val_max_sec,
+                                                 upscale_validation=upscale_validation,
+                                                 validation_loss_metric=validation_loss_metric,
+                                                 upscale_chunk_sec=upscale_chunk_sec,
+                                                 global_step=global_step,
+                                                 val_audio_output_dir=val_audio_output_dir,
+                                                 val_audio_reference_once=val_audio_reference_once,
+                                                 guidance_scale=val_guidance_scale,
+                                                 reconstruction_method=val_reconstruction_method)
                 loss = outdict['loss']
                 loss_value = float(loss.detach().cpu())
                 batch_samples = int(batch['hr'].shape[0]) if isinstance(batch, dict) and 'hr' in batch else 1
@@ -478,15 +569,27 @@ class Trainer(ABC):
                     lsd_total_values = outdict.get('lsd_total_per_sample')
                     lsd_high_values = outdict.get('lsd_high_per_sample')
                     lsd_low_values = outdict.get('lsd_low_per_sample')
+                    low_copy_lsd_values = outdict.get('low_copy_lsd_per_sample')
+                    wave_lsd_total_values = outdict.get('wave_lsd_total_per_sample')
+                    wave_lsd_high_values = outdict.get('wave_lsd_high_per_sample')
+                    wave_lsd_low_values = outdict.get('wave_lsd_low_per_sample')
                     if lsd_high_values:
                         total_lsd_high += sum(lsd_high_values)
                         total_lsd_total += sum(lsd_total_values)
                         total_lsd_low += sum(lsd_low_values)
+                        total_low_copy_lsd += sum(low_copy_lsd_values)
+                        total_wave_lsd_total += sum(wave_lsd_total_values)
+                        total_wave_lsd_high += sum(wave_lsd_high_values)
+                        total_wave_lsd_low += sum(wave_lsd_low_values)
                         cnt += len(lsd_high_values)
                     else:
                         total_lsd_high += outdict['lsd_high'] * batch_samples
                         total_lsd_total += (outdict.get('lsd_total') or 0.0) * batch_samples
                         total_lsd_low += (outdict.get('lsd_low') or 0.0) * batch_samples
+                        total_low_copy_lsd += (outdict.get('low_copy_lsd') or 0.0) * batch_samples
+                        total_wave_lsd_total += (outdict.get('wave_lsd_total') or 0.0) * batch_samples
+                        total_wave_lsd_high += (outdict.get('wave_lsd_high') or 0.0) * batch_samples
+                        total_wave_lsd_low += (outdict.get('wave_lsd_low') or 0.0) * batch_samples
                         cnt += batch_samples
 
                 synchronize_if_needed(self.device)
@@ -510,6 +613,10 @@ class Trainer(ABC):
                             "lsd_total": outdict.get('lsd_total') if outdict.get('lsd_total') is not None else "",
                             "lsd_high": outdict['lsd_high'] if outdict['lsd_high'] is not None else "",
                             "lsd_low": outdict.get('lsd_low') if outdict.get('lsd_low') is not None else "",
+                            "low_copy_lsd": outdict.get('low_copy_lsd') if outdict.get('low_copy_lsd') is not None else "",
+                            "wave_lsd_total": outdict.get('wave_lsd_total') if outdict.get('wave_lsd_total') is not None else "",
+                            "wave_lsd_high": outdict.get('wave_lsd_high') if outdict.get('wave_lsd_high') is not None else "",
+                            "wave_lsd_low": outdict.get('wave_lsd_low') if outdict.get('wave_lsd_low') is not None else "",
                         },
                     )
                 if track_monitor is not None:
@@ -527,6 +634,18 @@ class Trainer(ABC):
                         ),
                         outdict.get('lsd_low_per_sample') or (
                             outdict.get('lsd_low') if outdict.get('lsd_low') is not None else ""
+                        ),
+                        outdict.get('low_copy_lsd_per_sample') or (
+                            outdict.get('low_copy_lsd') if outdict.get('low_copy_lsd') is not None else ""
+                        ),
+                        outdict.get('wave_lsd_total_per_sample') or (
+                            outdict.get('wave_lsd_total') if outdict.get('wave_lsd_total') is not None else ""
+                        ),
+                        outdict.get('wave_lsd_high_per_sample') or (
+                            outdict.get('wave_lsd_high') if outdict.get('wave_lsd_high') is not None else ""
+                        ),
+                        outdict.get('wave_lsd_low_per_sample') or (
+                            outdict.get('wave_lsd_low') if outdict.get('wave_lsd_low') is not None else ""
                         ),
                         data_seconds,
                         compute_seconds,
@@ -547,11 +666,19 @@ class Trainer(ABC):
         avg_lsd_total = total_lsd_total / cnt if cnt > 0 else 0
         avg_lsd_high = total_lsd_high / cnt if cnt > 0 else 0
         avg_lsd_low = total_lsd_low / cnt if cnt > 0 else 0
+        avg_low_copy_lsd = total_low_copy_lsd / cnt if cnt > 0 else 0
+        avg_wave_lsd_total = total_wave_lsd_total / cnt if cnt > 0 else 0
+        avg_wave_lsd_high = total_wave_lsd_high / cnt if cnt > 0 else 0
+        avg_wave_lsd_low = total_wave_lsd_low / cnt if cnt > 0 else 0
         self.logger.log({
             "val/loss": avg_val_loss,
             "val/lsd_total": avg_lsd_total,
             "val/lsd_high": avg_lsd_high,
             "val/lsd_low": avg_lsd_low,
+            "val/low_copy_lsd": avg_low_copy_lsd,
+            "val/wave_lsd_total": avg_wave_lsd_total,
+            "val/wave_lsd_high": avg_wave_lsd_high,
+            "val/wave_lsd_low": avg_wave_lsd_low,
         }, step=global_step)
 
         if torch.cuda.is_available():
@@ -563,6 +690,10 @@ class Trainer(ABC):
             "lsd_total": avg_lsd_total,
             "lsd_high": avg_lsd_high,
             "lsd_low": avg_lsd_low,
+            "low_copy_lsd": avg_low_copy_lsd,
+            "wave_lsd_total": avg_wave_lsd_total,
+            "wave_lsd_high": avg_wave_lsd_high,
+            "wave_lsd_low": avg_wave_lsd_low,
             "wall_seconds": wall_seconds,
             "samples": total_samples,
             "samples_per_second": total_samples / wall_seconds if wall_seconds > 0 else 0.0,
@@ -597,9 +728,16 @@ class Trainer(ABC):
               val_audio_reference_once=False,
               val_guidance_scale=None,
               val_reconstruction_method="original",
+              validation_seed=None,
               resume_global_step=None,
               resume_epoch=None,
               resume_epoch_step=None,
+              amp_dtype=None,
+              amp_grad_scaler=True,
+              val_epoch_interval=None,
+              reset_best_loss_on_load=False,
+              t_sampling="uniform",
+              aux_highband_loss_weight=0.0,
               **kwargs):
         self.log_step_interval = log_step_interval
         total_val_batches = len(self.val_loader)
@@ -624,8 +762,32 @@ class Trainer(ABC):
             self.optimizer = self.get_optimizer(optimizer_config)
             if scheduler_config:
                 self.scheduler = self.get_scheduler(self.optimizer, scheduler_config)
+            amp_dtype_name = str(amp_dtype or "").lower()
+            if amp_dtype_name in {"", "none", "off", "false"}:
+                self.amp_enabled = False
+                self.amp_dtype = None
+            elif self.device.type != "cuda":
+                self.amp_enabled = False
+                self.amp_dtype = None
+                print(f"AMP dtype '{amp_dtype}' requested but ignored on device {self.device}.")
+            else:
+                if amp_dtype_name in {"fp16", "float16", "half"}:
+                    self.amp_dtype = torch.float16
+                elif amp_dtype_name in {"bf16", "bfloat16"}:
+                    self.amp_dtype = torch.bfloat16
+                else:
+                    raise ValueError("amp_dtype must be one of: off, fp16, float16, bf16, bfloat16.")
+                self.amp_enabled = True
+                print(f"CUDA AMP enabled with dtype={self.amp_dtype}.")
+            self.grad_scaler = torch.amp.GradScaler(
+                "cuda",
+                enabled=bool(self.amp_enabled and self.amp_dtype == torch.float16 and amp_grad_scaler),
+            )
             if ckpt_load_path:
                 self.load_checkpoint(ckpt_load_path)
+                if reset_best_loss_on_load:
+                    self.best_loss = float('inf')
+                    print("Reset checkpoint best_loss after loading checkpoint.")
 
             if resume_epoch is not None:
                 self.start_epoch = int(resume_epoch)
@@ -641,8 +803,90 @@ class Trainer(ABC):
                 start_epoch_step = int(self.checkpoint_epoch_step)
             else:
                 start_epoch_step = 0
+            if start_epoch_step >= len(self.train_loader):
+                completed_epochs, start_epoch_step = divmod(start_epoch_step, len(self.train_loader))
+                self.start_epoch += completed_epochs
             self.model.train()
             print(f"--- Starting training from epoch {self.start_epoch}, global step {global_step} ---")
+            if val_epoch_interval is not None:
+                val_epoch_interval = int(val_epoch_interval)
+                if val_epoch_interval <= 0:
+                    val_epoch_interval = None
+            if val_epoch_interval is not None:
+                print(f"Validation and checkpointing will run every {val_epoch_interval} epoch(s).")
+            if validation_seed is not None:
+                print(f"Validation ODE sampling seed: {int(validation_seed)}")
+            if str(t_sampling) != "uniform":
+                print(f"Training t sampling: {t_sampling}")
+            aux_highband_loss_weight = float(aux_highband_loss_weight or 0.0)
+            if aux_highband_loss_weight > 0:
+                print(f"Aux high-band loss enabled with weight {aux_highband_loss_weight:g}.")
+
+            def validate_and_checkpoint(epoch_idx, global_step, epoch_step, total_epoch_loss,
+                                        processed_batches, lr):
+                val_results = self.validate(
+                    global_step,
+                    val_idx,
+                    ode_steps=val_ode_steps,
+                    val_max_sec=val_max_sec,
+                    val_max_batches=val_max_batches,
+                    epoch_idx=epoch_idx,
+                    monitor=monitor,
+                    track_monitor=track_monitor,
+                    lr=lr,
+                    upscale_validation=upscale_validation,
+                    validation_loss_metric=validation_loss_metric,
+                    upscale_chunk_sec=upscale_chunk_sec,
+                    val_audio_output_dir=val_audio_output_dir,
+                    val_audio_reference_once=val_audio_reference_once,
+                    val_guidance_scale=val_guidance_scale,
+                    val_reconstruction_method=val_reconstruction_method,
+                    validation_seed=validation_seed,
+                )
+                avg_val_loss = val_results['loss']
+                print(f'\nStep {global_step} | Val Loss: {avg_val_loss:.6f}, '
+                      f'Val LSD-high: {val_results["lsd_high"]:.4f}\n')
+
+                is_best = avg_val_loss < self.best_loss
+                if is_best:
+                    self.best_loss = avg_val_loss
+                if epoch_summary_csv_path:
+                    append_csv_row(
+                        epoch_summary_csv_path,
+                        {
+                            "time": time.time(),
+                            "phase": "validation",
+                            "epoch": epoch_idx,
+                            "step": global_step,
+                            "train_loss_running": total_epoch_loss / max(1, processed_batches),
+                            "valid_loss": avg_val_loss,
+                            "valid_lsd_total": val_results["lsd_total"],
+                            "valid_lsd_high": val_results["lsd_high"],
+                            "valid_lsd_low": val_results["lsd_low"],
+                            "valid_low_copy_lsd": val_results["low_copy_lsd"],
+                            "valid_wave_lsd_total": val_results["wave_lsd_total"],
+                            "valid_wave_lsd_high": val_results["wave_lsd_high"],
+                            "valid_wave_lsd_low": val_results["wave_lsd_low"],
+                            "valid_wall_seconds": val_results["wall_seconds"],
+                            "valid_samples": val_results["samples"],
+                            "valid_samples_per_second": val_results["samples_per_second"],
+                            "valid_compute_samples_per_second": val_results["compute_samples_per_second"],
+                            "valid_mean_data_seconds": val_results["mean_data_seconds"],
+                            "valid_mean_compute_seconds": val_results["mean_compute_seconds"],
+                            "is_best": is_best,
+                            "best_loss": self.best_loss,
+                            "lr": lr,
+                            **memory_row(self.device),
+                            "max_rss_mb": max_rss_mb(),
+                        },
+                    )
+                self.save_checkpoint(
+                    epoch=epoch_idx,
+                    is_best=is_best,
+                    save_dir=ckpt_save_dir,
+                    global_step=global_step,
+                    epoch_step=epoch_step,
+                )
 
             for epoch_idx in range(self.start_epoch, num_epochs + 1):
                 resume_batches = start_epoch_step if epoch_idx == self.start_epoch else 0
@@ -669,9 +913,20 @@ class Trainer(ABC):
                     global_step += 1
 
                     self.optimizer.zero_grad(set_to_none=zero_grad_set_to_none)
-                    loss, loss_dict = self._train_step(batch, global_step)
-                    loss.backward()
-                    self.optimizer.step()
+                    with self._autocast_context():
+                        loss, loss_dict = self._train_step(
+                            batch,
+                            global_step,
+                            t_sampling=t_sampling,
+                            aux_highband_loss_weight=aux_highband_loss_weight,
+                        )
+                    if self.grad_scaler is not None and self.grad_scaler.is_enabled():
+                        self.grad_scaler.scale(loss).backward()
+                        self.grad_scaler.step(self.optimizer)
+                        self.grad_scaler.update()
+                    else:
+                        loss.backward()
+                        self.optimizer.step()
                     if scheduler_config:
                         self.scheduler.step()
 
@@ -711,64 +966,14 @@ class Trainer(ABC):
                         self.logger.log({f"model/{k}": v.item() for k, v in loss_dict.items()}, step=global_step)
 
                     # Validation
-                    if global_step % val_step_interval == 0:
-                        val_results = self.validate(
+                    if val_epoch_interval is None and global_step % val_step_interval == 0:
+                        validate_and_checkpoint(
+                            epoch_idx,
                             global_step,
-                            val_idx,
-                            ode_steps=val_ode_steps,
-                            val_max_sec=val_max_sec,
-                            val_max_batches=val_max_batches,
-                            epoch_idx=epoch_idx,
-                            monitor=monitor,
-                            track_monitor=track_monitor,
-                            lr=lr,
-                            upscale_validation=upscale_validation,
-                            validation_loss_metric=validation_loss_metric,
-                            upscale_chunk_sec=upscale_chunk_sec,
-                            val_audio_output_dir=val_audio_output_dir,
-                            val_audio_reference_once=val_audio_reference_once,
-                            val_guidance_scale=val_guidance_scale,
-                            val_reconstruction_method=val_reconstruction_method,
-                        )
-                        avg_val_loss = val_results['loss']
-                        print(f'\nStep {global_step} | Val Loss: {avg_val_loss:.6f}, '
-                              f'Val LSD-high: {val_results["lsd_high"]:.4f}\n')
-
-                        is_best = avg_val_loss < self.best_loss
-                        if is_best:
-                            self.best_loss = avg_val_loss
-                        if epoch_summary_csv_path:
-                            append_csv_row(
-                                epoch_summary_csv_path,
-                                {
-                                    "time": time.time(),
-                                    "phase": "validation",
-                                    "epoch": epoch_idx,
-                                    "step": global_step,
-                                    "train_loss_running": total_epoch_loss / max(1, processed_batches),
-                                    "valid_loss": avg_val_loss,
-                                    "valid_lsd_total": val_results["lsd_total"],
-                                    "valid_lsd_high": val_results["lsd_high"],
-                                    "valid_lsd_low": val_results["lsd_low"],
-                                    "valid_wall_seconds": val_results["wall_seconds"],
-                                    "valid_samples": val_results["samples"],
-                                    "valid_samples_per_second": val_results["samples_per_second"],
-                                    "valid_compute_samples_per_second": val_results["compute_samples_per_second"],
-                                    "valid_mean_data_seconds": val_results["mean_data_seconds"],
-                                    "valid_mean_compute_seconds": val_results["mean_compute_seconds"],
-                                    "is_best": is_best,
-                                    "best_loss": self.best_loss,
-                                    "lr": lr,
-                                    **memory_row(self.device),
-                                    "max_rss_mb": max_rss_mb(),
-                                },
-                            )
-                        self.save_checkpoint(
-                            epoch=epoch_idx,
-                            is_best=is_best,
-                            save_dir=ckpt_save_dir,
-                            global_step=global_step,
-                            epoch_step=batch_idx + 1,
+                            batch_idx + 1,
+                            total_epoch_loss,
+                            processed_batches,
+                            lr,
                         )
 
                     if global_step >= max_steps:
@@ -804,6 +1009,19 @@ class Trainer(ABC):
                             **memory_row(self.device),
                             "max_rss_mb": max_rss_mb(),
                         },
+                    )
+                if (
+                    val_epoch_interval is not None
+                    and processed_batches > 0
+                    and epoch_idx % val_epoch_interval == 0
+                ):
+                    validate_and_checkpoint(
+                        epoch_idx,
+                        global_step,
+                        len(self.train_loader),
+                        total_epoch_loss,
+                        processed_batches,
+                        self.optimizer.param_groups[0]['lr'],
                     )
 
             self.model.eval()
@@ -898,11 +1116,12 @@ class STFTTrainer(Trainer):
 
     def _synthesize_waveform(self, Y_lr, Y_hr, sr_values, lr_bin_count, hf_start_bin,
                              ode_steps, guidance_scale=None, orig_length=None,
-                             reconstruction_lr=None):
+                             reconstruction_lr=None, return_spec=False):
         """Full pipeline: ODE sampling -> spectral assembly -> waveform."""
         x1_hr = self._run_ode(Y_lr, Y_hr, sr_values, ode_steps, guidance_scale)
         x1_full = self._assemble_fullband(Y_lr, x1_hr, lr_bin_count, hf_start_bin, reconstruction_lr)
-        return self._postprocess(x1_full, orig_length=orig_length)
+        x1_wave = self._postprocess(x1_full, orig_length=orig_length)
+        return (x1_wave, x1_full) if return_spec else x1_wave
 
     # ------------------------------------------------------------------ #
     #  Metrics
@@ -912,9 +1131,36 @@ class STFTTrainer(Trainer):
         window = torch.hann_window(n_fft).to(audio.device)
         return torch.abs(torch.stft(audio, n_fft, hop_length, window=window, return_complex=True))
 
+    def _model_spec_log_power(self, spec):
+        """Convert model real/imag compressed STFT [B,2,F,T] to log power."""
+        complex_spec = torch.view_as_complex(spec.float().permute(0, 2, 3, 1).contiguous())
+        complex_spec = self.transform.compress.invert(complex_spec)
+        return torch.log10(complex_spec.abs().square().clamp(min=1e-6))
+
+    def _compute_spectral_lsd(self, pred_spec, target_spec, sr_khz, reduce=True):
+        """
+        Compute LSD directly on assembled model spectra before iSTFT.
+
+        This is the validation metric used for original-signal reconstruction:
+        high-band bins measure generated content, while low-band bins verify
+        the copied original low band.
+        """
+        bin_idx = self.model.sr_to_lr_bins[sr_khz]
+        sp = self._model_spec_log_power(pred_spec)
+        st = self._model_spec_log_power(target_spec)
+
+        def _lsd(a, b):
+            values = (a - b).square().mean(dim=1).sqrt().mean(dim=-1)
+            return values.mean() if reduce else values
+
+        lsd_total = _lsd(sp, st)
+        lsd_low = _lsd(sp[..., :bin_idx, :], st[..., :bin_idx, :])
+        lsd_high = _lsd(sp[..., bin_idx:, :], st[..., bin_idx:, :])
+        return lsd_total, lsd_high, lsd_low
+
     def _compute_lsd(self, pred, target, sr_khz, reduce=True):
         """
-        Compute Log-Spectral Distance with frequency band separation.
+        Compute waveform-level Log-Spectral Distance after iSTFT.
         Cutoff bin is derived from model config (sr_to_lr_bins).
         Returns: (lsd_total, lsd_high, lsd_low)
         """
@@ -934,7 +1180,7 @@ class STFTTrainer(Trainer):
 
     def _synthesize_upscale_chunks(self, y, z, sr_values, current_sr, ode_steps,
                                    chunk_sec=None, guidance_scale=None,
-                                   reconstruction_method="original"):
+                                   reconstruction_method="original", return_spectral_metrics=False):
         if reconstruction_method not in {"original", "original_signal"}:
             raise ValueError("reconstruction_method must be 'original' or 'original_signal'.")
         target_sr = getattr(getattr(self.transform, "complex_stft", None), "sampling_rate", 48000)
@@ -947,7 +1193,7 @@ class STFTTrainer(Trainer):
             reconstruction_lr = None
             if reconstruction_method == "original_signal":
                 reconstruction_lr = Z[:, :, :lr_bin_count, :]
-            return self._synthesize_waveform(
+            result = self._synthesize_waveform(
                 self._as_model_input(Y_lr),
                 self._as_model_input(Y_hr),
                 sr_values,
@@ -957,9 +1203,22 @@ class STFTTrainer(Trainer):
                 guidance_scale=guidance_scale,
                 orig_length=z.shape[-1],
                 reconstruction_lr=self._as_model_input(reconstruction_lr) if reconstruction_lr is not None else None,
+                return_spec=return_spectral_metrics,
             )
+            if not return_spectral_metrics:
+                return result
+            x1_wave, x1_spec = result
+            lsd_total, lsd_high, lsd_low = self._compute_spectral_lsd(x1_spec, Z, current_sr, reduce=False)
+            return x1_wave, {
+                "lsd_total": lsd_total,
+                "lsd_high": lsd_high,
+                "lsd_low": lsd_low,
+                "low_copy_lsd": lsd_low,
+            }
 
         chunks = []
+        metric_sums = None
+        metric_weight = 0
         for start in range(0, z.shape[-1], chunk_samples):
             z_chunk = z[..., start:start + chunk_samples]
             y_chunk = y[..., start:start + z_chunk.shape[-1]]
@@ -980,9 +1239,29 @@ class STFTTrainer(Trainer):
                 guidance_scale=guidance_scale,
                 orig_length=z_chunk.shape[-1],
                 reconstruction_lr=self._as_model_input(reconstruction_lr) if reconstruction_lr is not None else None,
+                return_spec=return_spectral_metrics,
             )
+            if return_spectral_metrics:
+                x1_chunk, x1_spec = x1_chunk
+                lsd_total, lsd_high, lsd_low = self._compute_spectral_lsd(x1_spec, Z, current_sr, reduce=False)
+                weight = x1_spec.shape[-1]
+                metric_values = {
+                    "lsd_total": lsd_total,
+                    "lsd_high": lsd_high,
+                    "lsd_low": lsd_low,
+                    "low_copy_lsd": lsd_low,
+                }
+                if metric_sums is None:
+                    metric_sums = {key: value * weight for key, value in metric_values.items()}
+                else:
+                    for key, value in metric_values.items():
+                        metric_sums[key] = metric_sums[key] + value * weight
+                metric_weight += weight
             chunks.append(x1_chunk[..., :z_chunk.shape[-1]])
-        return torch.cat(chunks, dim=-1)
+        x1_wave = torch.cat(chunks, dim=-1)
+        if not return_spectral_metrics:
+            return x1_wave
+        return x1_wave, {key: value / max(1, metric_weight) for key, value in metric_sums.items()}
 
     def _save_validation_audio_triplets(self, z, y, x1, batch_data, idx, global_step, output_dir,
                                         reference_once=False):
@@ -1136,6 +1415,28 @@ class STFTTrainer(Trainer):
             f"{prefix}/{idx}/{num_steps}/spec_generated":     wandb.Image(draw_spec(t2n(x1), sr=48000, return_fig=True)),
         }
 
+    def _sample_t(self, batch_size, sampling="uniform"):
+        shape = [batch_size, 1, 1, 1]
+        sampling = str(sampling or "uniform")
+        if sampling == "uniform":
+            return torch.rand(shape, device=self.device)
+        if sampling == "late_beta":
+            return torch.sqrt(torch.rand(shape, device=self.device))
+        if sampling == "mixed_late":
+            uniform = torch.rand(shape, device=self.device)
+            late = torch.sqrt(torch.rand(shape, device=self.device))
+            mask = torch.rand(shape, device=self.device) < 0.5
+            return torch.where(mask, late, uniform)
+        raise ValueError("train.t_sampling must be one of: uniform, late_beta, mixed_late.")
+
+    def _highband_log_spectral_loss(self, pred_hr, target_hr, lr_bin_count, hf_start_bin):
+        slice_start = max(0, lr_bin_count - hf_start_bin)
+        if slice_start >= pred_hr.shape[2]:
+            return pred_hr.sum() * 0
+        pred_log = self._model_spec_log_power(pred_hr[:, :, slice_start:, :])
+        target_log = self._model_spec_log_power(target_hr[:, :, slice_start:, :])
+        return (pred_log - target_log).square().mean(dim=1).sqrt().mean()
+
     # ------------------------------------------------------------------ #
     #  Train step
     # ------------------------------------------------------------------ #
@@ -1159,14 +1460,26 @@ class STFTTrainer(Trainer):
         Y_hr = self._as_model_input(Y_hr)
         Z_hr = self._as_model_input(Z_hr)
 
-        t = torch.rand([batch_size, 1, 1, 1], device=self.device)
+        t = self._sample_t(batch_size, kwargs.get("t_sampling", "uniform"))
         x0 = self.path.sample_source(Y_hr)
         xt = self._as_model_input(self.path.sample_xt(x0, Z_hr, t))
 
         output = self.model(xt, t, Y_lr, sr_values)
         target = self.path.get_target_vector_field(xt, x0, Z_hr, t)
-        loss = flow_matching_loss(predicted_vf=output, target_vf=target)
-        return loss, {"cfm_loss": loss}
+        cfm_loss = flow_matching_loss(predicted_vf=output, target_vf=target)
+        loss = cfm_loss
+        loss_dict = {"cfm_loss": cfm_loss}
+
+        aux_weight = float(kwargs.get("aux_highband_loss_weight", 0.0) or 0.0)
+        if aux_weight > 0:
+            sigma_min = float(getattr(self.path, "sigma_min", 1.0e-4))
+            a = 1 - (1 - sigma_min) * t
+            x1_hat = (1 - sigma_min) * xt + a * output
+            aux_loss = self._highband_log_spectral_loss(x1_hat, Z_hr, lr_bin_count, hf_start_bin)
+            loss = loss + aux_weight * aux_loss
+            loss_dict["aux_highband_loss"] = aux_loss
+            loss_dict["aux_highband_weighted"] = aux_loss * aux_weight
+        return loss, loss_dict
 
     # ------------------------------------------------------------------ #
     #  Validation step
@@ -1214,7 +1527,7 @@ class STFTTrainer(Trainer):
             loss = flow_matching_loss(predicted_vf=output, target_vf=target)
 
         with torch.no_grad():
-            x1_wave = self._synthesize_upscale_chunks(
+            x1_wave, spectral_lsd = self._synthesize_upscale_chunks(
                 y,
                 z,
                 sr_values,
@@ -1223,17 +1536,26 @@ class STFTTrainer(Trainer):
                 chunk_sec=upscale_chunk_sec,
                 guidance_scale=guidance_scale,
                 reconstruction_method=reconstruction_method,
+                return_spectral_metrics=True,
             )
             z_metric = z[..., :x1_wave.shape[-1]]
-            lsd_total_values, lsd_high_values, lsd_low_values = self._compute_lsd(
+            wave_lsd_total_values, wave_lsd_high_values, wave_lsd_low_values = self._compute_lsd(
                 x1_wave,
                 z_metric,
                 current_sr,
                 reduce=False,
             )
+            lsd_total_values = spectral_lsd["lsd_total"]
+            lsd_high_values = spectral_lsd["lsd_high"]
+            lsd_low_values = spectral_lsd["lsd_low"]
+            low_copy_lsd_values = spectral_lsd["low_copy_lsd"]
             lsd_total_tensor = lsd_total_values.mean()
             lsd_high_tensor = lsd_high_values.mean()
             lsd_low_tensor = lsd_low_values.mean()
+            low_copy_lsd_tensor = low_copy_lsd_values.mean()
+            wave_lsd_total_tensor = wave_lsd_total_values.mean()
+            wave_lsd_high_tensor = wave_lsd_high_values.mean()
+            wave_lsd_low_tensor = wave_lsd_low_values.mean()
 
         if upscale_validation:
             metric_losses = {
@@ -1272,7 +1594,7 @@ class STFTTrainer(Trainer):
                     current_sr,
                     ode_steps,
                     chunk_sec=upscale_chunk_sec,
-                    guidance_scale=1.5,
+                    guidance_scale=guidance_scale,
                     reconstruction_method=reconstruction_method,
                 )
 
@@ -1287,9 +1609,17 @@ class STFTTrainer(Trainer):
             'lsd_total': float(lsd_total_tensor),
             'lsd_high': float(lsd_high_tensor),
             'lsd_low': float(lsd_low_tensor),
+            'low_copy_lsd': float(low_copy_lsd_tensor),
+            'wave_lsd_total': float(wave_lsd_total_tensor),
+            'wave_lsd_high': float(wave_lsd_high_tensor),
+            'wave_lsd_low': float(wave_lsd_low_tensor),
             'lsd_total_per_sample': [float(value) for value in lsd_total_values],
             'lsd_high_per_sample': [float(value) for value in lsd_high_values],
             'lsd_low_per_sample': [float(value) for value in lsd_low_values],
+            'low_copy_lsd_per_sample': [float(value) for value in low_copy_lsd_values],
+            'wave_lsd_total_per_sample': [float(value) for value in wave_lsd_total_values],
+            'wave_lsd_high_per_sample': [float(value) for value in wave_lsd_high_values],
+            'wave_lsd_low_per_sample': [float(value) for value in wave_lsd_low_values],
             'audio_paths': audio_paths,
             'log_payload': log_payload,
         }

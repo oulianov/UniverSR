@@ -79,6 +79,8 @@ train:
   num_val_log_samples: 5
   val_ode_steps: 4
   val_max_sec: 5
+  t_sampling: uniform
+  aux_highband_loss_weight: 0.0
 
 eval:
   ode_steps: 4
