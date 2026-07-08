@@ -1,11 +1,17 @@
+import csv
 import os
+import resource
 import shutil
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime
+from pathlib import Path
 
 import soundfile as sf
+import numpy as np
 import torch
 import torch.nn as nn
+import torchaudio
 import wandb
 from torch.optim import lr_scheduler
 from tqdm import tqdm
@@ -36,6 +42,280 @@ def model_size_b(model: nn.Module) -> int:
     return size
 
 
+def synchronize_if_needed(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    elif device.type == "mps" and torch.backends.mps.is_available():
+        torch.mps.synchronize()
+
+
+def memory_row(device: torch.device) -> dict[str, float | str]:
+    row: dict[str, float | str] = {
+        "mps_allocated_mb": "",
+        "mps_driver_mb": "",
+        "mps_recommended_max_mb": "",
+        "cuda_allocated_mb": "",
+        "cuda_reserved_mb": "",
+    }
+    if device.type == "mps" and torch.backends.mps.is_available():
+        row["mps_allocated_mb"] = torch.mps.current_allocated_memory() / MiB
+        row["mps_driver_mb"] = torch.mps.driver_allocated_memory() / MiB
+        if hasattr(torch.mps, "recommended_max_memory"):
+            row["mps_recommended_max_mb"] = torch.mps.recommended_max_memory() / MiB
+    elif device.type == "cuda" and torch.cuda.is_available():
+        row["cuda_allocated_mb"] = torch.cuda.memory_allocated(device) / MiB
+        row["cuda_reserved_mb"] = torch.cuda.memory_reserved(device) / MiB
+    return row
+
+
+def max_rss_mb() -> float:
+    max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return max_rss / MiB if os.uname().sysname == "Darwin" else max_rss / 1024
+
+
+def append_csv_row(path: str | os.PathLike, row: dict[str, int | float | str | bool]) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    exists = output_path.exists() and output_path.stat().st_size > 0
+    fieldnames = list(row.keys())
+    if exists:
+        with output_path.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            existing_fieldnames = list(reader.fieldnames or [])
+            if existing_fieldnames and existing_fieldnames != fieldnames:
+                existing_rows = list(reader)
+                fieldnames = existing_fieldnames + [field for field in fieldnames if field not in existing_fieldnames]
+                tmp_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
+                with tmp_path.open("w", newline="") as tmp_handle:
+                    writer = csv.DictWriter(tmp_handle, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(existing_rows)
+                    writer.writerow(row)
+                    tmp_handle.flush()
+                    os.fsync(tmp_handle.fileno())
+                tmp_path.replace(output_path)
+                return
+
+    with output_path.open("a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+class CSVTrainingMonitor:
+    fieldnames = [
+        "time",
+        "phase",
+        "epoch",
+        "step",
+        "epoch_step",
+        "loss",
+        "cfm_loss",
+        "lsd_total",
+        "lsd_high",
+        "lsd_low",
+        "data_seconds",
+        "compute_seconds",
+        "samples_per_second",
+        "lr",
+        "mps_allocated_mb",
+        "mps_driver_mb",
+        "mps_recommended_max_mb",
+        "cuda_allocated_mb",
+        "cuda_reserved_mb",
+        "max_rss_mb",
+    ]
+
+    def __init__(self, path: str | os.PathLike, device: torch.device) -> None:
+        self.path = Path(path)
+        self.device = device
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        exists = self.path.exists() and self.path.stat().st_size > 0
+        self.handle = self.path.open("a", newline="")
+        self.writer = csv.DictWriter(self.handle, fieldnames=self.fieldnames, extrasaction="ignore")
+        if not exists:
+            self.writer.writeheader()
+
+    def close(self) -> None:
+        self.handle.close()
+
+    def log(
+        self,
+        phase: str,
+        epoch: int,
+        step: int,
+        epoch_step: int,
+        loss: float,
+        data_seconds: float,
+        compute_seconds: float,
+        batch_size: int,
+        lr: float,
+        extra: dict[str, float | str] | None = None,
+    ) -> None:
+        row = {field: "" for field in self.fieldnames}
+        row.update(
+            {
+                "time": time.time(),
+                "phase": phase,
+                "epoch": epoch,
+                "step": step,
+                "epoch_step": epoch_step,
+                "loss": loss,
+                "data_seconds": data_seconds,
+                "compute_seconds": compute_seconds,
+                "samples_per_second": batch_size / compute_seconds if compute_seconds > 0 else 0,
+                "lr": lr,
+                "max_rss_mb": max_rss_mb(),
+            }
+        )
+        row.update(memory_row(self.device))
+        if extra:
+            row.update(extra)
+        self.writer.writerow(row)
+        self.handle.flush()
+
+
+class CSVValidationTrackMonitor:
+    fieldnames = [
+        "time",
+        "epoch",
+        "step",
+        "validation_index",
+        "sample_index",
+        "folder",
+        "channel",
+        "filename",
+        "relpath",
+        "source_relpath",
+        "path",
+        "original_audio_path",
+        "degraded_audio_path",
+        "restored_audio_path",
+        "stereo_original_audio_path",
+        "stereo_degraded_audio_path",
+        "stereo_restored_audio_path",
+        "low_sr",
+        "loss",
+        "lsd_total",
+        "lsd_high",
+        "lsd_low",
+        "data_seconds",
+        "compute_seconds",
+        "val_max_sec",
+        "ode_steps",
+        "lr",
+        "mps_allocated_mb",
+        "mps_driver_mb",
+        "mps_recommended_max_mb",
+        "cuda_allocated_mb",
+        "cuda_reserved_mb",
+        "max_rss_mb",
+    ]
+
+    def __init__(self, path: str | os.PathLike, device: torch.device) -> None:
+        self.path = Path(path)
+        self.device = device
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        exists = self.path.exists() and self.path.stat().st_size > 0
+        self.handle = self.path.open("a", newline="")
+        self.writer = csv.DictWriter(self.handle, fieldnames=self.fieldnames)
+        if not exists:
+            self.writer.writeheader()
+
+    def close(self) -> None:
+        self.handle.close()
+
+    @staticmethod
+    def _metadata_from_relpath(relpath: str) -> tuple[str, str, str]:
+        parts = Path(relpath).parts
+        channel = ""
+        if parts and parts[0] in {"mid", "side"}:
+            channel = parts[0]
+            parts = parts[1:]
+        folder = parts[0] if len(parts) > 1 else "."
+        source_relpath = str(Path(*parts)) if parts else relpath
+        return folder, channel, source_relpath
+
+    @staticmethod
+    def _as_list(value, batch_size: int) -> list:
+        if isinstance(value, list):
+            return value
+        return [value] * batch_size
+
+    @staticmethod
+    def _value_at(value, sample_index: int):
+        if isinstance(value, list):
+            return value[sample_index]
+        return value
+
+    def log(
+        self,
+        epoch: int,
+        step: int,
+        validation_index: int,
+        batch_data: dict,
+        loss: float,
+        lsd_total: float | str,
+        lsd_high: float | str,
+        lsd_low: float | str,
+        data_seconds: float,
+        compute_seconds: float,
+        lr: float,
+        val_max_sec: int,
+        ode_steps: int,
+        audio_paths: list[dict[str, str]] | None = None,
+    ) -> None:
+        batch_size = int(batch_data["hr"].shape[0]) if "hr" in batch_data else 1
+        filenames = self._as_list(batch_data.get("filename", ""), batch_size)
+        relpaths = self._as_list(batch_data.get("relpath", ""), batch_size)
+        paths = self._as_list(batch_data.get("path", ""), batch_size)
+        low_srs = self._as_list(batch_data.get("low_sr", ""), batch_size)
+        audio_paths = audio_paths or [{} for _ in range(batch_size)]
+        memory = memory_row(self.device)
+        rss_mb = max_rss_mb()
+
+        for sample_index in range(batch_size):
+            sample_audio_paths = audio_paths[sample_index] if sample_index < len(audio_paths) else {}
+            relpath = str(relpaths[sample_index])
+            folder, channel, source_relpath = self._metadata_from_relpath(relpath)
+            row = {
+                "time": time.time(),
+                "epoch": epoch,
+                "step": step,
+                "validation_index": validation_index,
+                "sample_index": sample_index,
+                "folder": folder,
+                "channel": channel,
+                "filename": str(filenames[sample_index]),
+                "relpath": relpath,
+                "source_relpath": source_relpath,
+                "path": str(paths[sample_index]),
+                "original_audio_path": sample_audio_paths.get("original", ""),
+                "degraded_audio_path": sample_audio_paths.get("degraded", ""),
+                "restored_audio_path": sample_audio_paths.get("restored", ""),
+                "stereo_original_audio_path": sample_audio_paths.get("stereo_original", ""),
+                "stereo_degraded_audio_path": sample_audio_paths.get("stereo_degraded", ""),
+                "stereo_restored_audio_path": sample_audio_paths.get("stereo_restored", ""),
+                "low_sr": low_srs[sample_index],
+                "loss": self._value_at(loss, sample_index),
+                "lsd_total": self._value_at(lsd_total, sample_index),
+                "lsd_high": self._value_at(lsd_high, sample_index),
+                "lsd_low": self._value_at(lsd_low, sample_index),
+                "data_seconds": data_seconds,
+                "compute_seconds": compute_seconds,
+                "val_max_sec": val_max_sec,
+                "ode_steps": ode_steps,
+                "lr": lr,
+                **memory,
+                "max_rss_mb": rss_mb,
+            }
+            self.writer.writerow(row)
+        self.handle.flush()
+
+
 class Trainer(ABC):
     """Abstract base class for training."""
 
@@ -50,6 +330,8 @@ class Trainer(ABC):
         self.optimizer = None
         self.scheduler = None
         self.logger = logger
+        self.checkpoint_global_step = None
+        self.checkpoint_epoch_step = None
 
     @abstractmethod
     def _train_step(self, **kwargs) -> torch.Tensor:
@@ -74,7 +356,7 @@ class Trainer(ABC):
     # ------------------------------------------------------------------ #
     #  Checkpointing
     # ------------------------------------------------------------------ #
-    def save_checkpoint(self, epoch, is_best, save_dir, filename=None):
+    def save_checkpoint(self, epoch, is_best, save_dir, filename=None, global_step=None, epoch_step=None):
         os.makedirs(save_dir, exist_ok=True)
         state = {
             'epoch': epoch,
@@ -82,6 +364,10 @@ class Trainer(ABC):
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_loss': self.best_loss,
         }
+        if global_step is not None:
+            state['global_step'] = int(global_step)
+        if epoch_step is not None:
+            state['epoch_step'] = int(epoch_step)
         if self.scheduler:
             state['scheduler_state_dict'] = self.scheduler.state_dict()
 
@@ -111,11 +397,18 @@ class Trainer(ABC):
                 for key, value in state.items():
                     if torch.is_tensor(value):
                         state[key] = value.to(self.device)
-            self.start_epoch = checkpoint['epoch'] + 1
+            self.checkpoint_global_step = checkpoint.get('global_step')
+            self.checkpoint_epoch_step = checkpoint.get('epoch_step')
+            self.start_epoch = checkpoint['epoch'] if self.checkpoint_epoch_step is not None else checkpoint['epoch'] + 1
             self.best_loss = checkpoint.get('best_loss', float('inf'))
             if self.scheduler and 'scheduler_state_dict' in checkpoint:
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            print(f"Training checkpoint loaded from {ckpt_path}. Resuming from epoch {self.start_epoch}.")
+            resume_msg = f"Training checkpoint loaded from {ckpt_path}. Resuming from epoch {self.start_epoch}"
+            if self.checkpoint_global_step is not None:
+                resume_msg += f", global step {self.checkpoint_global_step}"
+            if self.checkpoint_epoch_step is not None:
+                resume_msg += f", epoch step {self.checkpoint_epoch_step}"
+            print(resume_msg + ".")
         else:
             self.model.load_state_dict(checkpoint)
             self.model.to(self.device)
@@ -136,36 +429,147 @@ class Trainer(ABC):
     # ------------------------------------------------------------------ #
     #  Validation / Train loops
     # ------------------------------------------------------------------ #
-    def validate(self, global_step, val_idx, ode_steps=4, val_max_sec=5):
+    def validate(self, global_step, val_idx, ode_steps=4, val_max_sec=5, val_max_batches=None,
+                 epoch_idx=0, monitor=None, track_monitor=None, lr=0.0,
+                 upscale_validation=False, validation_loss_metric="loss",
+                 upscale_chunk_sec=None, val_audio_output_dir=None,
+                 val_audio_reference_once=False, val_guidance_scale=None,
+                 val_reconstruction_method="original"):
         self.model.eval()
         total_val_loss = 0.0
-        total_metric = 0.0
+        total_lsd_total = 0.0
+        total_lsd_high = 0.0
+        total_lsd_low = 0.0
+        total_samples = 0
+        total_data_seconds = 0.0
+        total_compute_seconds = 0.0
         cnt = 0
-        val_pbar = tqdm(self.val_loader, desc='Validating...', dynamic_ncols=True)
+        num_batches = len(self.val_loader)
+        if val_max_batches is not None:
+            num_batches = min(num_batches, int(val_max_batches))
+        val_pbar = tqdm(range(num_batches), desc='Validating...', dynamic_ncols=True)
+        val_iter = iter(self.val_loader)
+        data_start = time.perf_counter()
+        wall_start = time.perf_counter()
 
         with torch.no_grad():
-            for idx, batch in enumerate(val_pbar):
+            for idx in val_pbar:
+                batch = next(val_iter)
+                data_seconds = time.perf_counter() - data_start
+                compute_start = time.perf_counter()
                 outdict = self._val_step(batch, idx, val_idx,
-                                         ode_steps=ode_steps, val_max_sec=val_max_sec)
+                                         ode_steps=ode_steps,
+                                         val_max_sec=val_max_sec,
+                                         upscale_validation=upscale_validation,
+                                         validation_loss_metric=validation_loss_metric,
+                                         upscale_chunk_sec=upscale_chunk_sec,
+                                         global_step=global_step,
+                                         val_audio_output_dir=val_audio_output_dir,
+                                         val_audio_reference_once=val_audio_reference_once,
+                                         guidance_scale=val_guidance_scale,
+                                         reconstruction_method=val_reconstruction_method)
                 loss = outdict['loss']
-                total_val_loss += loss.item()
+                loss_value = float(loss.detach().cpu())
+                batch_samples = int(batch['hr'].shape[0]) if isinstance(batch, dict) and 'hr' in batch else 1
+                loss_values = outdict.get('loss_per_sample')
+                total_val_loss += sum(loss_values) if loss_values else loss_value * batch_samples
 
                 if outdict['lsd_high'] is not None:
-                    total_metric += outdict['lsd_high']
-                    cnt += 1
-                val_pbar.set_postfix({'val_loss': f'{loss.item():.6f}'})
+                    lsd_total_values = outdict.get('lsd_total_per_sample')
+                    lsd_high_values = outdict.get('lsd_high_per_sample')
+                    lsd_low_values = outdict.get('lsd_low_per_sample')
+                    if lsd_high_values:
+                        total_lsd_high += sum(lsd_high_values)
+                        total_lsd_total += sum(lsd_total_values)
+                        total_lsd_low += sum(lsd_low_values)
+                        cnt += len(lsd_high_values)
+                    else:
+                        total_lsd_high += outdict['lsd_high'] * batch_samples
+                        total_lsd_total += (outdict.get('lsd_total') or 0.0) * batch_samples
+                        total_lsd_low += (outdict.get('lsd_low') or 0.0) * batch_samples
+                        cnt += batch_samples
+
+                synchronize_if_needed(self.device)
+                compute_seconds = time.perf_counter() - compute_start
+                total_samples += batch_samples
+                total_data_seconds += data_seconds
+                total_compute_seconds += compute_seconds
+
+                if monitor is not None:
+                    monitor.log(
+                        "valid",
+                        epoch_idx,
+                        global_step,
+                        idx + 1,
+                        loss_value,
+                        data_seconds,
+                        compute_seconds,
+                        batch_samples,
+                        lr,
+                        {
+                            "lsd_total": outdict.get('lsd_total') if outdict.get('lsd_total') is not None else "",
+                            "lsd_high": outdict['lsd_high'] if outdict['lsd_high'] is not None else "",
+                            "lsd_low": outdict.get('lsd_low') if outdict.get('lsd_low') is not None else "",
+                        },
+                    )
+                if track_monitor is not None:
+                    track_monitor.log(
+                        epoch_idx,
+                        global_step,
+                        idx + 1,
+                        batch,
+                        outdict.get('loss_per_sample') or loss_value,
+                        outdict.get('lsd_total_per_sample') or (
+                            outdict.get('lsd_total') if outdict.get('lsd_total') is not None else ""
+                        ),
+                        outdict.get('lsd_high_per_sample') or (
+                            outdict['lsd_high'] if outdict['lsd_high'] is not None else ""
+                        ),
+                        outdict.get('lsd_low_per_sample') or (
+                            outdict.get('lsd_low') if outdict.get('lsd_low') is not None else ""
+                        ),
+                        data_seconds,
+                        compute_seconds,
+                        lr,
+                        val_max_sec,
+                        ode_steps,
+                        audio_paths=outdict.get('audio_paths'),
+                    )
+
+                val_pbar.set_postfix({'val_loss': f'{loss_value:.6f}'})
 
                 if outdict['log_payload']:
                     self.logger.log(outdict['log_payload'], step=global_step)
 
-        avg_val_loss = total_val_loss / len(self.val_loader)
-        avg_metric = total_metric / cnt if cnt > 0 else 0
-        self.logger.log({"val/loss": avg_val_loss, "val/lsd_high": avg_metric}, step=global_step)
+                data_start = time.perf_counter()
+
+        avg_val_loss = total_val_loss / max(1, total_samples)
+        avg_lsd_total = total_lsd_total / cnt if cnt > 0 else 0
+        avg_lsd_high = total_lsd_high / cnt if cnt > 0 else 0
+        avg_lsd_low = total_lsd_low / cnt if cnt > 0 else 0
+        self.logger.log({
+            "val/loss": avg_val_loss,
+            "val/lsd_total": avg_lsd_total,
+            "val/lsd_high": avg_lsd_high,
+            "val/lsd_low": avg_lsd_low,
+        }, step=global_step)
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         self.model.train()
-        return {"loss": avg_val_loss, "lsd_high": avg_metric}
+        wall_seconds = time.perf_counter() - wall_start
+        return {
+            "loss": avg_val_loss,
+            "lsd_total": avg_lsd_total,
+            "lsd_high": avg_lsd_high,
+            "lsd_low": avg_lsd_low,
+            "wall_seconds": wall_seconds,
+            "samples": total_samples,
+            "samples_per_second": total_samples / wall_seconds if wall_seconds > 0 else 0.0,
+            "compute_samples_per_second": total_samples / total_compute_seconds if total_compute_seconds > 0 else 0.0,
+            "mean_data_seconds": total_data_seconds / max(1, num_batches),
+            "mean_compute_seconds": total_compute_seconds / max(1, num_batches),
+        }
 
     def train(self,
               num_epochs,
@@ -179,73 +583,236 @@ class Trainer(ABC):
               num_val_log_samples=10,
               val_ode_steps=4,
               val_max_sec=5,
+              val_max_batches=None,
+              train_metrics_interval=1,
+              zero_grad_set_to_none=False,
+              channels_last=False,
+              metrics_csv_path=None,
+              epoch_summary_csv_path=None,
+              val_track_metrics_csv_path=None,
+              upscale_validation=False,
+              validation_loss_metric="loss",
+              upscale_chunk_sec=None,
+              val_audio_output_dir=None,
+              val_audio_reference_once=False,
+              val_guidance_scale=None,
+              val_reconstruction_method="original",
+              resume_global_step=None,
+              resume_epoch=None,
+              resume_epoch_step=None,
               **kwargs):
         self.log_step_interval = log_step_interval
         total_val_batches = len(self.val_loader)
         val_idx = set(torch.linspace(0, total_val_batches - 1, num_val_log_samples).long().tolist())
+        monitor = CSVTrainingMonitor(metrics_csv_path, self.device) if metrics_csv_path else None
+        track_monitor = CSVValidationTrackMonitor(val_track_metrics_csv_path, self.device) if val_track_metrics_csv_path else None
+        if monitor is not None:
+            print(f"CSV step metrics: {Path(metrics_csv_path).resolve()}")
+        if track_monitor is not None:
+            print(f"CSV validation track metrics: {Path(val_track_metrics_csv_path).resolve()}")
+        if epoch_summary_csv_path:
+            print(f"CSV summaries: {Path(epoch_summary_csv_path).resolve()}")
+        if val_audio_output_dir:
+            print(f"Validation audio: {Path(val_audio_output_dir).resolve()}")
 
-        print(f'Training model with size: {model_size_b(self.model) / MiB:.3f} MiB')
-        self.model.to(self.device)
-        self.optimizer = self.get_optimizer(optimizer_config)
-        if scheduler_config:
-            self.scheduler = self.get_scheduler(self.optimizer, scheduler_config)
-        if ckpt_load_path:
-            self.load_checkpoint(ckpt_load_path)
+        try:
+            print(f'Training model with size: {model_size_b(self.model) / MiB:.3f} MiB')
+            if channels_last and self.device.type in ("cuda", "mps"):
+                self.model.to(self.device, memory_format=torch.channels_last)
+            else:
+                self.model.to(self.device)
+            self.optimizer = self.get_optimizer(optimizer_config)
+            if scheduler_config:
+                self.scheduler = self.get_scheduler(self.optimizer, scheduler_config)
+            if ckpt_load_path:
+                self.load_checkpoint(ckpt_load_path)
 
-        global_step = (self.start_epoch - 1) * len(self.train_loader)
-        self.model.train()
-        print(f"--- Starting training from epoch {self.start_epoch} ---")
+            if resume_epoch is not None:
+                self.start_epoch = int(resume_epoch)
+            if resume_global_step is not None:
+                global_step = int(resume_global_step)
+            elif self.checkpoint_global_step is not None:
+                global_step = int(self.checkpoint_global_step)
+            else:
+                global_step = (self.start_epoch - 1) * len(self.train_loader)
+            if resume_epoch_step is not None:
+                start_epoch_step = int(resume_epoch_step)
+            elif self.checkpoint_epoch_step is not None:
+                start_epoch_step = int(self.checkpoint_epoch_step)
+            else:
+                start_epoch_step = 0
+            self.model.train()
+            print(f"--- Starting training from epoch {self.start_epoch}, global step {global_step} ---")
 
-        for epoch_idx in range(self.start_epoch, num_epochs + 1):
-            epoch_pbar = tqdm(self.train_loader,
-                              desc=f'Epoch {epoch_idx}/{num_epochs}',
-                              dynamic_ncols=True, leave=True)
-            total_epoch_loss = 0.0
+            for epoch_idx in range(self.start_epoch, num_epochs + 1):
+                resume_batches = start_epoch_step if epoch_idx == self.start_epoch else 0
+                epoch_pbar = tqdm(range(resume_batches, len(self.train_loader)),
+                                  total=len(self.train_loader),
+                                  initial=resume_batches,
+                                  desc=f'Epoch {epoch_idx}/{num_epochs}',
+                                  dynamic_ncols=True, leave=True)
+                train_iter = iter(self.train_loader)
+                for _ in range(resume_batches):
+                    next(train_iter)
+                total_epoch_loss = 0.0
+                processed_batches = 0
+                total_samples = 0
+                total_data_seconds = 0.0
+                total_compute_seconds = 0.0
+                epoch_start = time.perf_counter()
+                data_start = time.perf_counter()
 
-            for batch_idx, batch in enumerate(epoch_pbar):
-                global_step += 1
+                for batch_idx in epoch_pbar:
+                    batch = next(train_iter)
+                    data_seconds = time.perf_counter() - data_start
+                    compute_start = time.perf_counter()
+                    global_step += 1
 
-                self.optimizer.zero_grad()
-                loss, loss_dict = self._train_step(batch, global_step)
-                loss.backward()
-                self.optimizer.step()
-                if scheduler_config:
-                    self.scheduler.step()
+                    self.optimizer.zero_grad(set_to_none=zero_grad_set_to_none)
+                    loss, loss_dict = self._train_step(batch, global_step)
+                    loss.backward()
+                    self.optimizer.step()
+                    if scheduler_config:
+                        self.scheduler.step()
 
-                total_epoch_loss += loss.item()
-                epoch_pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+                    synchronize_if_needed(self.device)
+                    compute_seconds = time.perf_counter() - compute_start
+                    loss_value = float(loss.detach().cpu())
+                    batch_samples = int(batch['hr'].shape[0]) if isinstance(batch, dict) and 'hr' in batch else 1
+                    total_epoch_loss += loss_value
+                    processed_batches += 1
+                    total_samples += batch_samples
+                    total_data_seconds += data_seconds
+                    total_compute_seconds += compute_seconds
+                    epoch_pbar.set_postfix({'loss': f'{loss_value:.6f}'})
 
-                # Step logging
-                if global_step % log_step_interval == 0:
-                    self.logger.log({"model/loss": loss.item()}, step=global_step)
-                    self.logger.log({"charts/lr-adam": self.optimizer.param_groups[0]['lr']}, step=global_step)
-                    self.logger.log({f"model/{k}": v.item() for k, v in loss_dict.items()}, step=global_step)
+                    lr = self.optimizer.param_groups[0]['lr']
+                    if monitor is not None and (
+                            train_metrics_interval <= 1
+                            or global_step == 1
+                            or global_step % train_metrics_interval == 0):
+                        monitor.log(
+                            "train",
+                            epoch_idx,
+                            global_step,
+                            batch_idx + 1,
+                            loss_value,
+                            data_seconds,
+                            compute_seconds,
+                            batch_samples,
+                            lr,
+                            {key: float(value.detach().cpu()) for key, value in loss_dict.items()},
+                        )
 
-                # Validation
-                if global_step % val_step_interval == 0:
-                    val_results = self.validate(global_step, val_idx,
-                                                ode_steps=val_ode_steps, val_max_sec=val_max_sec)
-                    avg_val_loss = val_results['loss']
-                    print(f'\nStep {global_step} | Val Loss: {avg_val_loss:.6f}, '
-                          f'Val LSD-high: {val_results["lsd_high"]:.4f}\n')
+                    # Step logging
+                    if global_step % log_step_interval == 0:
+                        self.logger.log({"model/loss": loss_value}, step=global_step)
+                        self.logger.log({"charts/lr-adam": lr}, step=global_step)
+                        self.logger.log({f"model/{k}": v.item() for k, v in loss_dict.items()}, step=global_step)
 
-                    is_best = avg_val_loss < self.best_loss
-                    if is_best:
-                        self.best_loss = avg_val_loss
-                    self.save_checkpoint(epoch=epoch_idx, is_best=is_best, save_dir=ckpt_save_dir)
+                    # Validation
+                    if global_step % val_step_interval == 0:
+                        val_results = self.validate(
+                            global_step,
+                            val_idx,
+                            ode_steps=val_ode_steps,
+                            val_max_sec=val_max_sec,
+                            val_max_batches=val_max_batches,
+                            epoch_idx=epoch_idx,
+                            monitor=monitor,
+                            track_monitor=track_monitor,
+                            lr=lr,
+                            upscale_validation=upscale_validation,
+                            validation_loss_metric=validation_loss_metric,
+                            upscale_chunk_sec=upscale_chunk_sec,
+                            val_audio_output_dir=val_audio_output_dir,
+                            val_audio_reference_once=val_audio_reference_once,
+                            val_guidance_scale=val_guidance_scale,
+                            val_reconstruction_method=val_reconstruction_method,
+                        )
+                        avg_val_loss = val_results['loss']
+                        print(f'\nStep {global_step} | Val Loss: {avg_val_loss:.6f}, '
+                              f'Val LSD-high: {val_results["lsd_high"]:.4f}\n')
 
-                if global_step >= max_steps:
-                    print(f'\nReached max_steps ({max_steps}). Finishing training.')
-                    self.save_checkpoint(epoch=epoch_idx, is_best=False, save_dir=ckpt_save_dir,
-                                         filename=f'step_{global_step}.pth')
-                    return
+                        is_best = avg_val_loss < self.best_loss
+                        if is_best:
+                            self.best_loss = avg_val_loss
+                        if epoch_summary_csv_path:
+                            append_csv_row(
+                                epoch_summary_csv_path,
+                                {
+                                    "time": time.time(),
+                                    "phase": "validation",
+                                    "epoch": epoch_idx,
+                                    "step": global_step,
+                                    "train_loss_running": total_epoch_loss / max(1, processed_batches),
+                                    "valid_loss": avg_val_loss,
+                                    "valid_lsd_total": val_results["lsd_total"],
+                                    "valid_lsd_high": val_results["lsd_high"],
+                                    "valid_lsd_low": val_results["lsd_low"],
+                                    "valid_wall_seconds": val_results["wall_seconds"],
+                                    "valid_samples": val_results["samples"],
+                                    "valid_samples_per_second": val_results["samples_per_second"],
+                                    "valid_compute_samples_per_second": val_results["compute_samples_per_second"],
+                                    "valid_mean_data_seconds": val_results["mean_data_seconds"],
+                                    "valid_mean_compute_seconds": val_results["mean_compute_seconds"],
+                                    "is_best": is_best,
+                                    "best_loss": self.best_loss,
+                                    "lr": lr,
+                                    **memory_row(self.device),
+                                    "max_rss_mb": max_rss_mb(),
+                                },
+                            )
+                        self.save_checkpoint(
+                            epoch=epoch_idx,
+                            is_best=is_best,
+                            save_dir=ckpt_save_dir,
+                            global_step=global_step,
+                            epoch_step=batch_idx + 1,
+                        )
 
-            avg_epoch_loss = total_epoch_loss / len(self.train_loader)
-            print(f'Epoch {epoch_idx} completed. Average Loss: {avg_epoch_loss:.6f}')
-            self.logger.log({"model/epoch_loss": avg_epoch_loss, "charts/epoch": epoch_idx}, step=global_step)
+                    if global_step >= max_steps:
+                        print(f'\nReached max_steps ({max_steps}). Finishing training.')
+                        self.save_checkpoint(epoch=epoch_idx, is_best=False, save_dir=ckpt_save_dir,
+                                             filename=f'step_{global_step}.pth',
+                                             global_step=global_step,
+                                             epoch_step=batch_idx + 1)
+                        return
 
-        self.model.eval()
-        print('Training finished!')
+                    data_start = time.perf_counter()
+
+                avg_epoch_loss = total_epoch_loss / max(1, processed_batches)
+                epoch_wall_seconds = time.perf_counter() - epoch_start
+                print(f'Epoch {epoch_idx} completed. Average Loss: {avg_epoch_loss:.6f}')
+                self.logger.log({"model/epoch_loss": avg_epoch_loss, "charts/epoch": epoch_idx}, step=global_step)
+                if epoch_summary_csv_path:
+                    append_csv_row(
+                        epoch_summary_csv_path,
+                        {
+                            "time": time.time(),
+                            "phase": "epoch",
+                            "epoch": epoch_idx,
+                            "step": global_step,
+                            "train_loss": avg_epoch_loss,
+                            "train_wall_seconds": epoch_wall_seconds,
+                            "train_samples": total_samples,
+                            "train_samples_per_second": total_samples / epoch_wall_seconds if epoch_wall_seconds > 0 else 0.0,
+                            "train_compute_samples_per_second": total_samples / total_compute_seconds if total_compute_seconds > 0 else 0.0,
+                            "train_mean_data_seconds": total_data_seconds / max(1, len(self.train_loader)),
+                            "train_mean_compute_seconds": total_compute_seconds / max(1, len(self.train_loader)),
+                            "lr": self.optimizer.param_groups[0]['lr'],
+                            **memory_row(self.device),
+                            "max_rss_mb": max_rss_mb(),
+                        },
+                    )
+
+            self.model.eval()
+            print('Training finished!')
+        finally:
+            if monitor is not None:
+                monitor.close()
+            if track_monitor is not None:
+                track_monitor.close()
 
 
 # ====================================================================== #
@@ -255,10 +822,12 @@ class Trainer(ABC):
 class STFTTrainer(Trainer):
     """Flow-matching trainer operating in the STFT domain."""
 
-    def __init__(self, model, path, transform, **kwargs):
+    def __init__(self, model, path, transform, lowpass_on_device=False, channels_last=False, **kwargs):
         super().__init__(model, **kwargs)
         self.path = path
         self.transform = transform
+        self.lowpass_on_device = lowpass_on_device
+        self.channels_last = channels_last
 
     # ------------------------------------------------------------------ #
     #  Spectral pre/post-processing
@@ -269,6 +838,23 @@ class STFTTrainer(Trainer):
         real = torch.view_as_real(spec.squeeze(1))
         real = real.permute(0, 3, 1, 2)
         return real[:, :, :-1, :]
+
+    def _make_lr_wave(self, hr_wave, sr_values):
+        current_sr = sr_values[0].item() if hasattr(sr_values[0], 'item') else sr_values[0]
+        target_sr = getattr(getattr(self.transform, "complex_stft", None), "sampling_rate", 48000)
+        original_len = hr_wave.shape[-1]
+        low_sr = int(current_sr) * 1000
+
+        lr_wave = torchaudio.functional.resample(hr_wave, orig_freq=target_sr, new_freq=low_sr)
+        lr_wave = torchaudio.functional.resample(lr_wave, orig_freq=low_sr, new_freq=target_sr)
+        if lr_wave.shape[-1] < original_len:
+            lr_wave = torch.nn.functional.pad(lr_wave, (0, original_len - lr_wave.shape[-1]))
+        return lr_wave[..., :original_len]
+
+    def _as_model_input(self, tensor):
+        if self.channels_last and tensor.ndim == 4 and tensor.device.type in ("cuda", "mps"):
+            return tensor.contiguous(memory_format=torch.channels_last)
+        return tensor
 
     def _postprocess(self, spec, orig_length):
         """real-valued STFT [B,2,F,T] -> waveform [B,T]"""
@@ -290,10 +876,11 @@ class STFTTrainer(Trainer):
         Z_hr = Z[:, :, hf_start_bin:, :]
         return Y_lr, Y_hr, Z_hr
 
-    def _assemble_fullband(self, Y_lr, x1_hr, lr_bin_count, hf_start_bin):
+    def _assemble_fullband(self, Y_lr, x1_hr, lr_bin_count, hf_start_bin, reconstruction_lr=None):
         """Concatenate LR condition with generated HR to form fullband spectrum."""
         slice_start = max(0, lr_bin_count - hf_start_bin)
-        return torch.cat([Y_lr, x1_hr[:, :, slice_start:, :]], dim=2)
+        low_band = reconstruction_lr if reconstruction_lr is not None else Y_lr
+        return torch.cat([low_band, x1_hr[:, :, slice_start:, :]], dim=2)
 
     # ------------------------------------------------------------------ #
     #  ODE inference
@@ -310,10 +897,11 @@ class STFTTrainer(Trainer):
         return solver.simulate(x0, ts, y=Y_lr, sr_values=sr_values)
 
     def _synthesize_waveform(self, Y_lr, Y_hr, sr_values, lr_bin_count, hf_start_bin,
-                             ode_steps, guidance_scale=None, orig_length=None):
+                             ode_steps, guidance_scale=None, orig_length=None,
+                             reconstruction_lr=None):
         """Full pipeline: ODE sampling -> spectral assembly -> waveform."""
         x1_hr = self._run_ode(Y_lr, Y_hr, sr_values, ode_steps, guidance_scale)
-        x1_full = self._assemble_fullband(Y_lr, x1_hr, lr_bin_count, hf_start_bin)
+        x1_full = self._assemble_fullband(Y_lr, x1_hr, lr_bin_count, hf_start_bin, reconstruction_lr)
         return self._postprocess(x1_full, orig_length=orig_length)
 
     # ------------------------------------------------------------------ #
@@ -324,7 +912,7 @@ class STFTTrainer(Trainer):
         window = torch.hann_window(n_fft).to(audio.device)
         return torch.abs(torch.stft(audio, n_fft, hop_length, window=window, return_complex=True))
 
-    def _compute_lsd(self, pred, target, sr_khz):
+    def _compute_lsd(self, pred, target, sr_khz, reduce=True):
         """
         Compute Log-Spectral Distance with frequency band separation.
         Cutoff bin is derived from model config (sr_to_lr_bins).
@@ -336,12 +924,180 @@ class STFTTrainer(Trainer):
         st = torch.log10(self._stft_magnitude(target.squeeze(1)).square().clamp(min=1e-6))
 
         def _lsd(a, b):
-            return (a - b).square().mean(dim=1).sqrt().mean()
+            values = (a - b).square().mean(dim=1).sqrt().mean(dim=-1)
+            return values.mean() if reduce else values
 
         lsd_total = _lsd(sp, st)
         lsd_low = _lsd(sp[..., :bin_idx, :], st[..., :bin_idx, :])
         lsd_high = _lsd(sp[..., bin_idx:, :], st[..., bin_idx:, :])
         return lsd_total, lsd_high, lsd_low
+
+    def _synthesize_upscale_chunks(self, y, z, sr_values, current_sr, ode_steps,
+                                   chunk_sec=None, guidance_scale=None,
+                                   reconstruction_method="original"):
+        if reconstruction_method not in {"original", "original_signal"}:
+            raise ValueError("reconstruction_method must be 'original' or 'original_signal'.")
+        target_sr = getattr(getattr(self.transform, "complex_stft", None), "sampling_rate", 48000)
+        chunk_samples = int(float(chunk_sec) * target_sr) if chunk_sec else z.shape[-1]
+        if chunk_samples <= 0 or chunk_samples >= z.shape[-1]:
+            lr_bin_count, hf_start_bin = self._get_freq_bins(current_sr)
+            Y = self._preprocess(y)
+            Z = self._preprocess(z)
+            Y_lr, Y_hr, _ = self._split_spectrum(Y, Z, lr_bin_count, hf_start_bin)
+            reconstruction_lr = None
+            if reconstruction_method == "original_signal":
+                reconstruction_lr = Z[:, :, :lr_bin_count, :]
+            return self._synthesize_waveform(
+                self._as_model_input(Y_lr),
+                self._as_model_input(Y_hr),
+                sr_values,
+                lr_bin_count,
+                hf_start_bin,
+                ode_steps,
+                guidance_scale=guidance_scale,
+                orig_length=z.shape[-1],
+                reconstruction_lr=self._as_model_input(reconstruction_lr) if reconstruction_lr is not None else None,
+            )
+
+        chunks = []
+        for start in range(0, z.shape[-1], chunk_samples):
+            z_chunk = z[..., start:start + chunk_samples]
+            y_chunk = y[..., start:start + z_chunk.shape[-1]]
+            lr_bin_count, hf_start_bin = self._get_freq_bins(current_sr)
+            Y = self._preprocess(y_chunk)
+            Z = self._preprocess(z_chunk)
+            Y_lr, Y_hr, _ = self._split_spectrum(Y, Z, lr_bin_count, hf_start_bin)
+            reconstruction_lr = None
+            if reconstruction_method == "original_signal":
+                reconstruction_lr = Z[:, :, :lr_bin_count, :]
+            x1_chunk = self._synthesize_waveform(
+                self._as_model_input(Y_lr),
+                self._as_model_input(Y_hr),
+                sr_values,
+                lr_bin_count,
+                hf_start_bin,
+                ode_steps,
+                guidance_scale=guidance_scale,
+                orig_length=z_chunk.shape[-1],
+                reconstruction_lr=self._as_model_input(reconstruction_lr) if reconstruction_lr is not None else None,
+            )
+            chunks.append(x1_chunk[..., :z_chunk.shape[-1]])
+        return torch.cat(chunks, dim=-1)
+
+    def _save_validation_audio_triplets(self, z, y, x1, batch_data, idx, global_step, output_dir,
+                                        reference_once=False):
+        if not output_dir:
+            return None
+
+        target_sr = getattr(getattr(self.transform, "complex_stft", None), "sampling_rate", 48000)
+        batch_size = z.shape[0]
+        relpaths = batch_data.get('relpath', [f"batch{idx:03d}_sample{i:02d}.wav" for i in range(batch_size)])
+        if not isinstance(relpaths, list):
+            relpaths = [relpaths] * batch_size
+
+        base_dir = Path(output_dir)
+        step_dir = base_dir / f"step_{int(global_step):08d}"
+        reference_dir = base_dir / "reference"
+        audio_paths = []
+
+        def _sample_to_numpy(tensor, sample_index):
+            sample = tensor[sample_index]
+            if sample.dim() == 2 and sample.shape[0] == 1:
+                sample = sample.squeeze(0)
+            return t2n(sample)
+
+        def _read_mono(path):
+            audio, _ = sf.read(path, dtype="float32", always_2d=False)
+            if audio.ndim == 2:
+                audio = audio[:, 0]
+            return audio.astype(np.float32, copy=False)
+
+        def _write_stereo_from_mid_side(mid_path, side_path, output_path):
+            if not mid_path.exists() or not side_path.exists():
+                return False
+            mid = _read_mono(mid_path)
+            side = _read_mono(side_path)
+            length = min(mid.shape[-1], side.shape[-1])
+            if length <= 0:
+                return False
+            stereo = np.stack([mid[:length] + side[:length], mid[:length] - side[:length]], axis=-1)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            sf.write(output_path, np.clip(stereo, -1.0, 1.0), target_sr)
+            return True
+
+        def _maybe_write_stereo(relpath, original_path, degraded_path, restored_path):
+            parts = relpath.parts
+            if not parts or parts[0] not in {"mid", "side"}:
+                return {}
+            channel = parts[0]
+            other_channel = "side" if channel == "mid" else "mid"
+            source_relpath = Path(*parts[1:])
+
+            def _swap_channel(path):
+                path_parts = list(path.parts)
+                for index, part in enumerate(path_parts):
+                    if part == channel:
+                        path_parts[index] = other_channel
+                        break
+                return Path(*path_parts)
+
+            stereo_ref_dir = reference_dir / "stereo" / source_relpath.parent
+            stereo_step_dir = step_dir / "stereo" / source_relpath.parent
+            stem = source_relpath.stem
+            stereo_original = stereo_ref_dir / f"{stem}_original.wav"
+            stereo_degraded = stereo_ref_dir / f"{stem}_degraded.wav"
+            stereo_restored = stereo_step_dir / f"{stem}_restored.wav"
+
+            original_other = _swap_channel(original_path)
+            degraded_other = _swap_channel(degraded_path)
+            restored_other = _swap_channel(restored_path)
+            if not stereo_original.exists():
+                _write_stereo_from_mid_side(
+                    original_path if channel == "mid" else original_other,
+                    original_other if channel == "mid" else original_path,
+                    stereo_original,
+                )
+            if not stereo_degraded.exists():
+                _write_stereo_from_mid_side(
+                    degraded_path if channel == "mid" else degraded_other,
+                    degraded_other if channel == "mid" else degraded_path,
+                    stereo_degraded,
+                )
+            _write_stereo_from_mid_side(
+                restored_path if channel == "mid" else restored_other,
+                restored_other if channel == "mid" else restored_path,
+                stereo_restored,
+            )
+            return {
+                "stereo_original": str(stereo_original) if stereo_original.exists() else "",
+                "stereo_degraded": str(stereo_degraded) if stereo_degraded.exists() else "",
+                "stereo_restored": str(stereo_restored) if stereo_restored.exists() else "",
+            }
+
+        for sample_index in range(batch_size):
+            relpath = Path(str(relpaths[sample_index]))
+            out_dir = step_dir / relpath.parent
+            ref_dir = reference_dir / relpath.parent if reference_once else out_dir
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ref_dir.mkdir(parents=True, exist_ok=True)
+            stem = relpath.stem
+            original_path = ref_dir / f"{stem}_original.wav"
+            degraded_path = ref_dir / f"{stem}_degraded.wav"
+            restored_path = out_dir / f"{stem}_restored.wav"
+
+            if not reference_once or not original_path.exists():
+                sf.write(original_path, _sample_to_numpy(z, sample_index), target_sr)
+            if not reference_once or not degraded_path.exists():
+                sf.write(degraded_path, _sample_to_numpy(y, sample_index), target_sr)
+            sf.write(restored_path, _sample_to_numpy(x1, sample_index), target_sr)
+            paths = {
+                "original": str(original_path),
+                "degraded": str(degraded_path),
+                "restored": str(restored_path),
+            }
+            paths.update(_maybe_write_stereo(relpath, original_path, degraded_path, restored_path))
+            audio_paths.append(paths)
+        return audio_paths
 
     def _calculate_2f_model_metric(self, z_c, x1_c):
         """Calculate 2f-model (PEAQ) metric for a batch of audio samples."""
@@ -388,16 +1144,24 @@ class STFTTrainer(Trainer):
         lr_bin_count, hf_start_bin = self._get_freq_bins(sr_values[0])
 
         z = batch_data['hr'].to(self.device)
-        y = batch_data['lr_wave'].to(self.device)
+        if 'lr_wave' in batch_data:
+            y = batch_data['lr_wave'].to(self.device)
+        elif self.lowpass_on_device:
+            y = self._make_lr_wave(z, sr_values)
+        else:
+            raise KeyError("batch_data must include 'lr_wave' unless lowpass_on_device is enabled.")
         batch_size = z.shape[0]
 
         Z = self._preprocess(z)
         Y = self._preprocess(y)
         Y_lr, Y_hr, Z_hr = self._split_spectrum(Y, Z, lr_bin_count, hf_start_bin)
+        Y_lr = self._as_model_input(Y_lr)
+        Y_hr = self._as_model_input(Y_hr)
+        Z_hr = self._as_model_input(Z_hr)
 
         t = torch.rand([batch_size, 1, 1, 1], device=self.device)
         x0 = self.path.sample_source(Y_hr)
-        xt = self.path.sample_xt(x0, Z_hr, t)
+        xt = self._as_model_input(self.path.sample_xt(x0, Z_hr, t))
 
         output = self.model(xt, t, Y_lr, sr_values)
         target = self.path.get_target_vector_field(xt, x0, Z_hr, t)
@@ -410,53 +1174,125 @@ class STFTTrainer(Trainer):
     def _val_step(self, batch_data, idx, val_idx, **kwargs):
         ode_steps = kwargs.get('ode_steps', 4)
         val_max_sec = kwargs.get('val_max_sec', 5)
+        upscale_validation = kwargs.get('upscale_validation', False)
+        validation_loss_metric = kwargs.get('validation_loss_metric', 'loss')
+        upscale_chunk_sec = kwargs.get('upscale_chunk_sec', None)
+        global_step = kwargs.get('global_step', 0)
+        val_audio_output_dir = kwargs.get('val_audio_output_dir', None)
+        val_audio_reference_once = kwargs.get('val_audio_reference_once', False)
+        guidance_scale = kwargs.get('guidance_scale', None)
+        reconstruction_method = kwargs.get('reconstruction_method', 'original')
 
         sr_values = batch_data['low_sr']
         current_sr = sr_values[0]
         lr_bin_count, hf_start_bin = self._get_freq_bins(current_sr)
+        target_sr = getattr(getattr(self.transform, "complex_stft", None), "sampling_rate", 48000)
 
-        z = batch_data['hr'].to(self.device)[..., :48000 * val_max_sec]
-        y = batch_data['lr_wave'].to(self.device)[..., :48000 * val_max_sec]
+        z = batch_data['hr'].to(self.device)[..., :target_sr * val_max_sec]
+        if 'lr_wave' in batch_data:
+            y = batch_data['lr_wave'].to(self.device)[..., :target_sr * val_max_sec]
+        elif self.lowpass_on_device:
+            y = self._make_lr_wave(z, sr_values)
+        else:
+            raise KeyError("batch_data must include 'lr_wave' unless lowpass_on_device is enabled.")
         batch_size = z.shape[0]
 
-        Z = self._preprocess(z)
-        Y = self._preprocess(y)
-        Y_lr, Y_hr, Z_hr = self._split_spectrum(Y, Z, lr_bin_count, hf_start_bin)
+        loss = None
+        if not upscale_validation:
+            Z = self._preprocess(z)
+            Y = self._preprocess(y)
+            Y_lr, Y_hr, Z_hr = self._split_spectrum(Y, Z, lr_bin_count, hf_start_bin)
+            Y_lr = self._as_model_input(Y_lr)
+            Y_hr = self._as_model_input(Y_hr)
+            Z_hr = self._as_model_input(Z_hr)
 
-        # CFM loss on random t
-        t = torch.rand([batch_size, 1, 1, 1], device=self.device)
-        x0 = self.path.sample_source(Y_hr)
-        xt = self.path.sample_xt(x0, Z_hr, t)
-        output = self.model(xt, t, Y_lr, sr_values)
-        target = self.path.get_target_vector_field(xt, x0, Z_hr, t)
-        loss = flow_matching_loss(predicted_vf=output, target_vf=target)
+            t = torch.rand([batch_size, 1, 1, 1], device=self.device)
+            x0 = self.path.sample_source(Y_hr)
+            xt = self._as_model_input(self.path.sample_xt(x0, Z_hr, t))
+            output = self.model(xt, t, Y_lr, sr_values)
+            target = self.path.get_target_vector_field(xt, x0, Z_hr, t)
+            loss = flow_matching_loss(predicted_vf=output, target_vf=target)
 
-        # LSD-high via ODE sampling (same metric used in evaluation)
-        lsd_high = None
         with torch.no_grad():
-            x1_wave = self._synthesize_waveform(
-                Y_lr, Y_hr, sr_values, lr_bin_count, hf_start_bin, ode_steps,
-                orig_length=z.shape[-1])
-            _, lsd_high, _ = self._compute_lsd(
-                x1_wave, z[..., :x1_wave.shape[-1]], current_sr)
-            lsd_high = float(lsd_high)
+            x1_wave = self._synthesize_upscale_chunks(
+                y,
+                z,
+                sr_values,
+                current_sr,
+                ode_steps,
+                chunk_sec=upscale_chunk_sec,
+                guidance_scale=guidance_scale,
+                reconstruction_method=reconstruction_method,
+            )
+            z_metric = z[..., :x1_wave.shape[-1]]
+            lsd_total_values, lsd_high_values, lsd_low_values = self._compute_lsd(
+                x1_wave,
+                z_metric,
+                current_sr,
+                reduce=False,
+            )
+            lsd_total_tensor = lsd_total_values.mean()
+            lsd_high_tensor = lsd_high_values.mean()
+            lsd_low_tensor = lsd_low_values.mean()
+
+        if upscale_validation:
+            metric_losses = {
+                "lsd_total": lsd_total_tensor,
+                "lsd_high": lsd_high_tensor,
+                "lsd_low": lsd_low_tensor,
+            }
+            loss = metric_losses.get(validation_loss_metric, lsd_high_tensor)
+            loss_per_sample = {
+                "lsd_total": lsd_total_values,
+                "lsd_high": lsd_high_values,
+                "lsd_low": lsd_low_values,
+            }.get(validation_loss_metric, lsd_high_values)
+        else:
+            loss_per_sample = None
+
+        audio_paths = self._save_validation_audio_triplets(
+            z_metric,
+            y[..., :z_metric.shape[-1]],
+            x1_wave[..., :z_metric.shape[-1]],
+            batch_data,
+            idx,
+            global_step,
+            val_audio_output_dir,
+            reference_once=val_audio_reference_once,
+        )
 
         # Sample logging for selected indices
         log_payload = {}
         if idx in val_idx:
             with torch.no_grad():
-                x1_wave_cfg = self._synthesize_waveform(
-                    Y[0:1, :, :lr_bin_count, :],
-                    Y[0:1, :, hf_start_bin:, :],
-                    sr_values, lr_bin_count, hf_start_bin,
-                    ode_steps, guidance_scale=1.5, orig_length=z[0:1].shape[-1])
+                x1_wave_cfg = self._synthesize_upscale_chunks(
+                    y[0:1],
+                    z[0:1],
+                    sr_values,
+                    current_sr,
+                    ode_steps,
+                    chunk_sec=upscale_chunk_sec,
+                    guidance_scale=1.5,
+                    reconstruction_method=reconstruction_method,
+                )
 
                 min_len = min(z.shape[-1], x1_wave_cfg.shape[-1])
                 log_payload = self._build_sample_log(
                     z[0:1, ..., :min_len], y[0:1, ..., :min_len], x1_wave_cfg,
                     idx, ode_steps, prefix="val_samples")
 
-        return {'loss': loss, 'lsd_high': lsd_high, 'log_payload': log_payload}
+        return {
+            'loss': loss,
+            'loss_per_sample': [float(value) for value in loss_per_sample] if loss_per_sample is not None else None,
+            'lsd_total': float(lsd_total_tensor),
+            'lsd_high': float(lsd_high_tensor),
+            'lsd_low': float(lsd_low_tensor),
+            'lsd_total_per_sample': [float(value) for value in lsd_total_values],
+            'lsd_high_per_sample': [float(value) for value in lsd_high_values],
+            'lsd_low_per_sample': [float(value) for value in lsd_low_values],
+            'audio_paths': audio_paths,
+            'log_payload': log_payload,
+        }
 
     # ------------------------------------------------------------------ #
     #  Evaluation
@@ -517,11 +1353,18 @@ class STFTTrainer(Trainer):
         lr_bin_count, hf_start_bin = self._get_freq_bins(current_sr)
 
         z = batch_data['hr'].to(self.device)[..., :48000 * val_max_sec]
-        y = batch_data['lr_wave'].to(self.device)[..., :48000 * val_max_sec]
+        if 'lr_wave' in batch_data:
+            y = batch_data['lr_wave'].to(self.device)[..., :48000 * val_max_sec]
+        elif self.lowpass_on_device:
+            y = self._make_lr_wave(z, sr_values)
+        else:
+            raise KeyError("batch_data must include 'lr_wave' unless lowpass_on_device is enabled.")
 
         Z = self._preprocess(z)
         Y = self._preprocess(y)
         Y_lr, Y_hr, _ = self._split_spectrum(Y, Z, lr_bin_count, hf_start_bin)
+        Y_lr = self._as_model_input(Y_lr)
+        Y_hr = self._as_model_input(Y_hr)
 
         # ODE synthesis
         x1_wave = self._synthesize_waveform(

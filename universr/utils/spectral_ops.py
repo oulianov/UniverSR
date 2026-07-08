@@ -33,6 +33,7 @@ class AmplitudeCompressedComplexSTFT(InvertibleFeatureExtractor):
         alpha, beta, comp_eps,
         hop_length=None, n_hops=None,
         learnable_window=False,
+        fast_compression=False,
         *args, **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -44,6 +45,7 @@ class AmplitudeCompressedComplexSTFT(InvertibleFeatureExtractor):
             compression_exponent=alpha,
             scale_factor=beta,
             comp_eps=comp_eps,
+            fast_compression=fast_compression,
         )
 
     def forward(self, x: Tensor, **kwargs):
@@ -104,11 +106,18 @@ class ComplexSTFT(InvertibleFeatureExtractor):
         return x
 
 class CompressAmplitudesAndScale(InvertibleFeatureExtractor):
-    def __init__(self, compression_exponent: float, scale_factor: float, comp_eps: float, *args, **kwargs):
+    def __init__(
+            self,
+            compression_exponent: float,
+            scale_factor: float,
+            comp_eps: float,
+            fast_compression: bool = False,
+            *args, **kwargs):
         super().__init__()
         self.compression_exponent = compression_exponent
         self.scale_factor = scale_factor
         self.comp_eps = comp_eps
+        self.fast_compression = fast_compression
 
     def forward(self, X: Tensor, **kwargs):
         """
@@ -118,7 +127,11 @@ class CompressAmplitudesAndScale(InvertibleFeatureExtractor):
         beta = self.scale_factor
         if alpha != 1:
             X = X + self.comp_eps
-            X = X.abs()**alpha * torch.exp(1j * X.angle())
+            if self.fast_compression:
+                magnitude = X.abs().clamp_min(self.comp_eps)
+                X = X * magnitude.pow(alpha - 1.0)
+            else:
+                X = X.abs()**alpha * torch.exp(1j * X.angle())
         return X * beta
 
     def invert(self, X: Tensor, **kwargs):
@@ -129,7 +142,10 @@ class CompressAmplitudesAndScale(InvertibleFeatureExtractor):
         beta = self.scale_factor
         X = X / beta
         if alpha != 1:
-            X = X.abs()**(1/alpha) * torch.exp(1j * X.angle())
+            if self.fast_compression:
+                magnitude = X.abs().clamp_min(self.comp_eps)
+                X = X * magnitude.pow((1 / alpha) - 1.0)
+            else:
+                X = X.abs()**(1/alpha) * torch.exp(1j * X.angle())
         return X
-
 
