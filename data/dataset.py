@@ -118,7 +118,6 @@ class Dataset(torch.utils.data.Dataset):
             return load_audio_file(wb_path)
 
         target_input_frames = max(1, math.ceil(self._target_len() * info.samplerate / self.sr))
-        margin_frames = max(2048, math.ceil(0.05 * info.samplerate))
         if self.mode == "train" and info.frames > target_input_frames:
             max_start = max(0, info.frames - target_input_frames)
             start = int(np.random.randint(0, max_start + 1))
@@ -126,7 +125,7 @@ class Dataset(torch.utils.data.Dataset):
             start = max(0, (info.frames - target_input_frames) // 2)
         else:
             start = 0
-        frames = min(info.frames - start, target_input_frames + margin_frames)
+        frames = min(info.frames - start, target_input_frames)
         try:
             return load_audio_file(wb_path, start=start, frames=frames)
         except RuntimeError:
@@ -135,6 +134,12 @@ class Dataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         wb_path, channel_label = self.wb_items[idx]
         y, sr = self._read_audio(wb_path)
+
+        # Apply one attenuation to the stereo segment before channel conversion.
+        # This preserves the natural mid/side balance and never amplifies quiet
+        # passages or low-energy side-channel noise.
+        gain_db = float(np.random.uniform(-6.0, -1.0)) if self.mode == "train" else -3.0
+        y = y * (10.0 ** (gain_db / 20.0))
 
         if self.channel_mode == "mid-side":
             if y.size(0) == 1:
@@ -146,12 +151,6 @@ class Dataset(torch.utils.data.Dataset):
             y = (left + right) * 0.5 if channel_label == "mid" else (left - right) * 0.5
         elif y.size(0) > 1:
             y = y.mean(dim=0, keepdim=True)
-    
-        # gain & normalize (peak normalize to target dBFS)
-        gain = np.random.uniform(-1, -6) if self.mode == 'train' else -3
-        peak = y.abs().max().clamp(min=1e-8)
-        target_peak = 10 ** (gain / 20.0)
-        y = y * (target_peak / peak)
         
         # resample
         if sr != self.sr:
@@ -168,7 +167,9 @@ class Dataset(torch.utils.data.Dataset):
         elif self.mode in ['val']:
             target_signal_len = self._target_len()
             current_signal_len = y.shape[-1]
-            if current_signal_len > target_signal_len and self.val_segment_position == "middle":
+            if current_signal_len < target_signal_len:
+                y = self._ensure(y, target_signal_len, repeat=False)
+            elif current_signal_len > target_signal_len and self.val_segment_position == "middle":
                 s = max(0, (current_signal_len - target_signal_len) // 2)
                 y = y[..., s:s + target_signal_len]
             else:

@@ -287,11 +287,9 @@ class ConvNeXtUNetCond(ConditionalVectorFieldModel):
                  feature_enc_layers=10,
                  cond_dropout_prob=0.1,
                  sr_to_lr_bins={8: 80, 12: 128, 16: 170, 24: 256},
-                 ):
+        ):
         super().__init__()
         self.strides = 2**len(dims)
-        self.min_bottleneck_frames = 7
-        self.min_input_frames = self.min_bottleneck_frames * self.strides
         self.time_embedder = SinusoidalTimeEmbedding(dim=time_dim)        
         self.total_freq_bins = total_freq_bins
         self.hr_freq_bins = hr_freq_bins
@@ -346,12 +344,6 @@ class ConvNeXtUNetCond(ConditionalVectorFieldModel):
         
     def _pad_frames(self, x):
         num_frames = x.shape[-1]
-        if num_frames < self.min_input_frames:
-            raise ValueError(
-                f"Input spectrogram has {num_frames} frames, but this UNet requires at least "
-                f"{self.min_input_frames} frames so the bottleneck remains >= "
-                f"{self.min_bottleneck_frames} frames."
-            )
         pad_len = (self.strides - num_frames % self.strides) % self.strides
         if pad_len:
             x = torch.nn.functional.pad(x, [0,pad_len,0,0], mode='reflect')
