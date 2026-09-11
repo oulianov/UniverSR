@@ -46,8 +46,8 @@ def parse_args():
                         choices=['euler', 'midpoint', 'rk4'], help="ODE solver method.")
     parser.add_argument('--guidance-scale', type=float, default=1.5, help="CFG guidance scale (None=disabled).")
     parser.add_argument('--reconstruction-method', type=str, default='original_signal',
-                        choices=['original', 'original_signal'],
-                        help="Spectrum assembly method. original keeps legacy behavior; original_signal preserves original low-frequency bins.")
+                        choices=['original', 'original_signal', 'seamless_reconstruction_soft'],
+                        help="Spectrum assembly method. original keeps legacy behavior; original_signal preserves original low-frequency bins; seamless_reconstruction_soft also caps generated highs at the source peak in the 500 Hz below the cutoff.")
     parser.add_argument('--device', type=str, default='cuda', choices=['cuda', 'cpu'])
     return parser.parse_args()
 

@@ -4,6 +4,7 @@ Inference wrapper module.
 """
 
 import logging
+import math
 import os
 import time
 from typing import Literal, Optional, Union
@@ -24,8 +25,8 @@ from universr.utils.spectral_ops import AmplitudeCompressedComplexSTFT
 # Supported input sample rates (kHz) and their corresponding LR frequency bins
 SUPPORTED_INPUT_SR = {8000, 12000, 16000, 24000}
 TARGET_SR = 48000
-RECONSTRUCTION_METHODS = {"original", "original_signal"}
-ReconstructionMethod = Literal["original", "original_signal"]
+RECONSTRUCTION_METHODS = {"original", "original_signal", "seamless_reconstruction_soft"}
+ReconstructionMethod = Literal["original", "original_signal", "seamless_reconstruction_soft"]
 logger = logging.getLogger(__name__)
 
 
@@ -211,6 +212,9 @@ class UniverSR(torch.nn.Module):
                    low-frequency reconstruction. "original_signal" keeps the
                    bandwidth-limited signal as the model condition but uses the
                    unfiltered 48 kHz input for the final low-frequency bins.
+                   "seamless_reconstruction_soft" uses the same source bins and
+                   caps each generated bin's magnitude at the source maximum in
+                   the 500 Hz below the cutoff, independently per batch and frame.
 
         Returns:
             Enhanced waveform tensor of shape (1,T) at target_sr.
@@ -257,7 +261,7 @@ class UniverSR(torch.nn.Module):
         MIN_SAMPLES = 32_768
         original_len = wav.shape[-1]
         wav = torch.nn.functional.pad(wav, (0, max(0, MIN_SAMPLES - wav.shape[-1])))
-        if reconstruction_method == "original_signal":
+        if reconstruction_method != "original":
             if original_wav_48k.shape[-1] > wav.shape[-1]:
                 original_wav_48k = original_wav_48k[..., : wav.shape[-1]]
             elif original_wav_48k.shape[-1] < wav.shape[-1]:
@@ -271,7 +275,7 @@ class UniverSR(torch.nn.Module):
             wav = wav.unsqueeze(0).unsqueeze(0)
         elif wav.dim() == 2:
             wav = wav.unsqueeze(0)
-        if reconstruction_method == "original_signal":
+        if reconstruction_method != "original":
             if original_wav_48k.dim() == 1:
                 original_wav_48k = original_wav_48k.unsqueeze(0).unsqueeze(0)
             elif original_wav_48k.dim() == 2:
@@ -288,7 +292,7 @@ class UniverSR(torch.nn.Module):
             guidance_scale,
             reconstruction_method=reconstruction_method,
             reconstruction_audio=(
-                original_wav_48k if reconstruction_method == "original_signal" else None
+                original_wav_48k if reconstruction_method != "original" else None
             ),
         )
 
@@ -479,13 +483,28 @@ class UniverSR(torch.nn.Module):
         x1_spec = x1_spec[:, :, slice_start:, :]
         if reconstruction_method == "original":
             full_spec = torch.cat([Y_lr, x1_spec], dim=2)
-        elif reconstruction_method == "original_signal":
+        elif reconstruction_method in {"original_signal", "seamless_reconstruction_soft"}:
             if reconstruction_audio is None:
                 raise ValueError(
                     "reconstruction_audio is required when "
-                    "reconstruction_method='original_signal'."
+                    f"reconstruction_method={reconstruction_method!r}."
                 )
             Y_reconstruction = self._preprocess(reconstruction_audio.to(self._device))
+            if reconstruction_method == "seamless_reconstruction_soft":
+                cutoff_hz = sr_khz * 500
+                stft = self.transform.complex_stft
+                band_start = math.ceil((cutoff_hz - 500) * stft.n_fft / stft.sampling_rate)
+                band_end = math.ceil(cutoff_hz * stft.n_fft / stft.sampling_rate)
+                reference = Y_reconstruction[:, :, band_start:band_end, :]
+                ceiling = torch.linalg.vector_norm(reference, dim=1, keepdim=True).amax(
+                    dim=2, keepdim=True
+                )
+                magnitude = torch.linalg.vector_norm(x1_spec, dim=1, keepdim=True)
+                # Compression is monotonic, so this also caps uncompressed power.
+                # Scale real/imaginary components together to preserve phase;
+                # leave bins below the ceiling (including zero bins) untouched.
+                gain = (ceiling / magnitude.clamp_min(torch.finfo(magnitude.dtype).tiny)).clamp_max(1)
+                x1_spec = x1_spec * gain
             full_spec = torch.cat(
                 [Y_reconstruction[:, :, :lr_bin_count, :], x1_spec],
                 dim=2,
