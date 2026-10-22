@@ -189,6 +189,7 @@ class UniverSR(torch.nn.Module):
         ode_steps: int = 4,
         guidance_scale: Optional[float] = 1.5,
         reconstruction_method: ReconstructionMethod = "original_signal",
+        cutoff_hz: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Enhance a low-resolution audio signal to high-resolution.
@@ -215,6 +216,14 @@ class UniverSR(torch.nn.Module):
                    "seamless_reconstruction_soft" uses the same source bins and
                    caps each generated bin's magnitude at the source maximum in
                    the 500 Hz below the cutoff, independently per batch and frame.
+            cutoff_hz: Frequency in Hz from which generated audio replaces the
+                   source. Defaults to the Nyquist frequency of the effective
+                   input rate. A higher cutoff keeps the source up to it: the
+                   model still generates from its own band edge, and only the
+                   generated bins at or above cutoff_hz are kept. When the file is
+                   already at target_sr and input_sr is omitted, the highest
+                   supported input rate whose Nyquist does not exceed cutoff_hz
+                   is used.
 
         Returns:
             Enhanced waveform tensor of shape (1,T) at target_sr.
@@ -231,6 +240,16 @@ class UniverSR(torch.nn.Module):
 
         # Determine the effective bandwidth SR
         effective_sr = input_sr if input_sr is not None else file_sr
+        if input_sr is None and cutoff_hz is not None and file_sr == target_sr:
+            # The model generates everything above its band edge, so any rate at
+            # or below the cutoff covers it; the highest one keeps the most source.
+            eligible_srs = [sr for sr in SUPPORTED_INPUT_SR if sr // 2 <= cutoff_hz]
+            if not eligible_srs:
+                raise ValueError(
+                    f"cutoff_hz={cutoff_hz} is below the lowest supported cutoff "
+                    f"({min(SUPPORTED_INPUT_SR) // 2} Hz)."
+                )
+            effective_sr = max(eligible_srs)
 
         if effective_sr not in SUPPORTED_INPUT_SR:
             if effective_sr == target_sr and input_sr is None:
@@ -261,7 +280,8 @@ class UniverSR(torch.nn.Module):
         MIN_SAMPLES = 32_768
         original_len = wav.shape[-1]
         wav = torch.nn.functional.pad(wav, (0, max(0, MIN_SAMPLES - wav.shape[-1])))
-        if reconstruction_method != "original":
+        needs_source = reconstruction_method != "original" or cutoff_hz is not None
+        if needs_source:
             if original_wav_48k.shape[-1] > wav.shape[-1]:
                 original_wav_48k = original_wav_48k[..., : wav.shape[-1]]
             elif original_wav_48k.shape[-1] < wav.shape[-1]:
@@ -275,7 +295,7 @@ class UniverSR(torch.nn.Module):
             wav = wav.unsqueeze(0).unsqueeze(0)
         elif wav.dim() == 2:
             wav = wav.unsqueeze(0)
-        if reconstruction_method != "original":
+        if needs_source:
             if original_wav_48k.dim() == 1:
                 original_wav_48k = original_wav_48k.unsqueeze(0).unsqueeze(0)
             elif original_wav_48k.dim() == 2:
@@ -291,9 +311,8 @@ class UniverSR(torch.nn.Module):
             ode_steps,
             guidance_scale,
             reconstruction_method=reconstruction_method,
-            reconstruction_audio=(
-                original_wav_48k if reconstruction_method != "original" else None
-            ),
+            reconstruction_audio=original_wav_48k if needs_source else None,
+            cutoff_hz=cutoff_hz,
         )
 
         # (1,T)
@@ -391,6 +410,7 @@ class UniverSR(torch.nn.Module):
         guidance_scale: Optional[float],
         reconstruction_method: ReconstructionMethod = "original_signal",
         reconstruction_audio: Optional[torch.Tensor] = None,
+        cutoff_hz: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Core inference pipeline:
@@ -400,15 +420,25 @@ class UniverSR(torch.nn.Module):
         4. Solve ODE (flow matching)
         5. Concatenate LR + generated HF
         6. iSTFT to waveform
+
+        cutoff_hz moves the boundary of step 5 above the model's own cutoff
+        (sr_khz * 500 Hz): bins below it come from reconstruction_audio and only
+        generated bins at or above it are kept.
         """
+        if reconstruction_method not in RECONSTRUCTION_METHODS:
+            raise ValueError(
+                f"Unsupported reconstruction_method={reconstruction_method!r}. "
+                f"Supported methods: {sorted(RECONSTRUCTION_METHODS)}"
+            )
         debug_logs_enabled = self._debug_logs_enabled()
         stage_timings: dict[str, float] = {}
         if debug_logs_enabled:
             logger.info(
-                "[UniverSR] Inference start: input_shape=%s sr_khz=%s ode_method=%s "
-                "ode_steps=%s guidance_scale=%s device=%s",
+                "[UniverSR] Inference start: input_shape=%s sr_khz=%s cutoff_hz=%s "
+                "ode_method=%s ode_steps=%s guidance_scale=%s device=%s",
                 tuple(lr_audio.shape),
                 sr_khz,
+                cutoff_hz,
                 ode_method,
                 ode_steps,
                 guidance_scale,
@@ -421,6 +451,30 @@ class UniverSR(torch.nn.Module):
         lr_bin_count = self.model.sr_to_lr_bins[sr_khz]
         hf_start_bin = self.model.total_freq_bins - self.model.hr_freq_bins
         orig_length = lr_audio.shape[-1]
+        stft = self.transform.complex_stft
+        model_cutoff_hz = sr_khz * 500
+        if cutoff_hz is None:
+            cutoff_hz = model_cutoff_hz
+        custom_cutoff = cutoff_hz != model_cutoff_hz
+        if custom_cutoff:
+            if not model_cutoff_hz < cutoff_hz < stft.sampling_rate / 2:
+                raise ValueError(
+                    f"cutoff_hz={cutoff_hz} must be above the {model_cutoff_hz} Hz "
+                    f"cutoff of sr_khz={sr_khz} and below "
+                    f"{stft.sampling_rate // 2} Hz."
+                )
+            # First bin whose centre frequency is at or above the cutoff.
+            source_bin_count = math.ceil(cutoff_hz * stft.n_fft / stft.sampling_rate)
+        else:
+            source_bin_count = lr_bin_count
+        uses_source = reconstruction_method != "original" or custom_cutoff
+        if uses_source and reconstruction_audio is None:
+            reason = (
+                f"cutoff_hz={cutoff_hz}"
+                if custom_cutoff
+                else f"reconstruction_method={reconstruction_method!r}"
+            )
+            raise ValueError(f"reconstruction_audio is required with {reason}.")
 
         # STFT
         if debug_logs_enabled:
@@ -479,20 +533,21 @@ class UniverSR(torch.nn.Module):
         # Concatenate LR bins + generated HF bins (handle overlapping region)
         if debug_logs_enabled:
             assemble_start = self._start_timing()
-        slice_start = max(0, lr_bin_count - hf_start_bin)
+        slice_start = max(0, source_bin_count - hf_start_bin)
         x1_spec = x1_spec[:, :, slice_start:, :]
-        if reconstruction_method == "original":
+        if not uses_source:
             full_spec = torch.cat([Y_lr, x1_spec], dim=2)
-        elif reconstruction_method in {"original_signal", "seamless_reconstruction_soft"}:
-            if reconstruction_audio is None:
-                raise ValueError(
-                    "reconstruction_audio is required when "
-                    f"reconstruction_method={reconstruction_method!r}."
+        else:
+            assert reconstruction_audio is not None
+            source_audio = reconstruction_audio.to(self._device)
+            if reconstruction_method == "original":
+                # The authors' assembly takes the low band from the band-limited
+                # model input; at a custom cutoff, band-limit the source there.
+                source_audio = self._apply_bandwidth_limit(
+                    source_audio, 2 * cutoff_hz, stft.sampling_rate
                 )
-            Y_reconstruction = self._preprocess(reconstruction_audio.to(self._device))
+            Y_reconstruction = self._preprocess(source_audio)
             if reconstruction_method == "seamless_reconstruction_soft":
-                cutoff_hz = sr_khz * 500
-                stft = self.transform.complex_stft
                 band_start = math.ceil((cutoff_hz - 500) * stft.n_fft / stft.sampling_rate)
                 band_end = math.ceil(cutoff_hz * stft.n_fft / stft.sampling_rate)
                 reference = Y_reconstruction[:, :, band_start:band_end, :]
@@ -506,13 +561,8 @@ class UniverSR(torch.nn.Module):
                 gain = (ceiling / magnitude.clamp_min(torch.finfo(magnitude.dtype).tiny)).clamp_max(1)
                 x1_spec = x1_spec * gain
             full_spec = torch.cat(
-                [Y_reconstruction[:, :, :lr_bin_count, :], x1_spec],
+                [Y_reconstruction[:, :, :source_bin_count, :], x1_spec],
                 dim=2,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported reconstruction_method={reconstruction_method!r}. "
-                f"Supported methods: {sorted(RECONSTRUCTION_METHODS)}"
             )
         if debug_logs_enabled:
             stage_timings["assemble"] = self._finish_timing(assemble_start)

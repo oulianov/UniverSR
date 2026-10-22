@@ -74,6 +74,15 @@ If your audio is already at 48 kHz but has limited bandwidth, set `input_sr` to 
 output = model.enhance("fullband_file.wav", input_sr=16000)
 ```
 
+### Custom Cutoff
+
+`cutoff_hz` keeps the source up to any frequency above the model's cutoff and only uses generated audio above it. Without `input_sr`, a 48 kHz file runs at the highest supported rate whose Nyquist does not exceed the cutoff. All reconstruction methods apply at `cutoff_hz`. `original` band-limits the source there, and `seamless_reconstruction_soft` caps the generated bins at the source's level in the 500 Hz below it.
+
+```python
+# Generates with the 12 kHz model and keeps generated audio only above 16 kHz
+output = model.enhance("fullband_file.wav", cutoff_hz=16000)
+```
+
 ---
 
 ## 🤗 Pretrained Models
